@@ -18,28 +18,6 @@ extern "C" {
 
 class test_uct_sockaddr : public uct_test {
 public:
-    struct completion : public uct_completion_t {
-        volatile bool m_flag;
-
-        completion() : m_flag(false), m_status(UCS_INPROGRESS) {
-            count = 1;
-            func  = completion_cb;
-        }
-
-        ucs_status_t status() const {
-            return m_status;
-        }
-    private:
-        static void completion_cb(uct_completion_t *self, ucs_status_t status)
-        {
-            completion *c = static_cast<completion*>(self);
-            c->m_status   = status;
-            c->m_flag     = true;
-        }
-
-        ucs_status_t m_status;
-    };
-
     test_uct_sockaddr() : server(NULL), client(NULL), err_count(0),
                           server_recv_req(0), delay_conn_reply(false) {
     }
@@ -234,11 +212,18 @@ UCS_TEST_P(test_uct_sockaddr, connect_client_to_server_with_delay)
         delayed_conn_reqs.pop();
     }
 
-    completion comp;
+    uct_completion_t comp;
+    comp.func   = (uct_completion_callback_t)ucs_empty_function;
+    comp.count  = 1;
+    comp.status = UCS_OK;
+
     ucs_status_t status = uct_ep_flush(client->ep(0), 0, &comp);
     if (status == UCS_INPROGRESS) {
-        wait_for_flag(&comp.m_flag);
-        EXPECT_EQ(UCS_OK, comp.status());
+        do {
+            short_progress_loop();
+            /* coverity[loop_condition] */
+        } while (comp.count != 0);
+        EXPECT_EQ(UCS_OK, comp.status);
     } else {
         EXPECT_EQ(UCS_OK, status);
     }
@@ -351,11 +336,19 @@ UCS_TEST_SKIP_COND_P(test_uct_sockaddr, conn_to_non_exist_server,
         /* client - try to connect to a non-existing port on the server side */
         client->connect(0, *server, 0, m_connect_addr, client_iface_priv_data_cb,
                         NULL, NULL, this);
-        completion comp;
+
+        uct_completion_t comp;
+        comp.func   = (uct_completion_callback_t)ucs_empty_function;
+        comp.count  = 1;
+        comp.status = UCS_OK;
+
         ucs_status_t status = uct_ep_flush(client->ep(0), 0, &comp);
         if (status == UCS_INPROGRESS) {
-            wait_for_flag(&comp.m_flag);
-            EXPECT_EQ(UCS_ERR_UNREACHABLE, comp.status());
+            do {
+                short_progress_loop();
+                /* coverity[loop_condition] */
+            } while (comp.count != 0);
+            EXPECT_EQ(UCS_ERR_UNREACHABLE, comp.status);
         } else {
             EXPECT_EQ(UCS_ERR_UNREACHABLE, status);
         }
@@ -370,14 +363,15 @@ class test_uct_cm_sockaddr : public uct_test {
     friend class uct_test::entity;
 protected:
     enum {
-        TEST_STATE_CONNECT_REQUESTED   = UCS_BIT(0),
-        TEST_STATE_CLIENT_CONNECTED    = UCS_BIT(1),
-        TEST_STATE_SERVER_CONNECTED    = UCS_BIT(2),
-        TEST_STATE_CLIENT_DISCONNECTED = UCS_BIT(3),
-        TEST_STATE_SERVER_DISCONNECTED = UCS_BIT(4),
-        TEST_STATE_SERVER_REJECTED     = UCS_BIT(5),
-        TEST_STATE_CLIENT_GOT_REJECT   = UCS_BIT(6),
-        TEST_STATE_CLIENT_GOT_ERROR    = UCS_BIT(7)
+        TEST_STATE_CONNECT_REQUESTED             = UCS_BIT(0),
+        TEST_STATE_CLIENT_CONNECTED              = UCS_BIT(1),
+        TEST_STATE_SERVER_CONNECTED              = UCS_BIT(2),
+        TEST_STATE_CLIENT_DISCONNECTED           = UCS_BIT(3),
+        TEST_STATE_SERVER_DISCONNECTED           = UCS_BIT(4),
+        TEST_STATE_SERVER_REJECTED               = UCS_BIT(5),
+        TEST_STATE_CLIENT_GOT_REJECT             = UCS_BIT(6),
+        TEST_STATE_CLIENT_GOT_ERROR              = UCS_BIT(7),
+        TEST_STATE_CLIENT_GOT_SERVER_UNAVAILABLE = UCS_BIT(8)
     };
 
     enum {
@@ -429,20 +423,6 @@ public:
     }
 
 protected:
-
-    void skip_tcp_sockcm() {
-        uct_component_attr_t cmpt_attr;
-        ucs_status_t status;
-
-        cmpt_attr.field_mask = UCT_COMPONENT_ATTR_FIELD_NAME;
-        /* coverity[var_deref_model] */
-        status = uct_component_query(GetParam()->component, &cmpt_attr);
-        ASSERT_UCS_OK(status);
-
-        if (!strcmp(cmpt_attr.name, "tcp")) {
-            UCS_TEST_SKIP_R("tcp cm is not fully implemented");
-        }
-    }
 
     void start_listen(uct_cm_listener_conn_request_callback_t server_conn_req_cb) {
         uct_listener_params_t params;
@@ -658,6 +638,8 @@ protected:
 
         if (status == UCS_ERR_REJECTED) {
             self->m_state |= TEST_STATE_CLIENT_GOT_REJECT;
+        } else if ((status == UCS_ERR_UNREACHABLE) || (status == UCS_ERR_NOT_CONNECTED)) {
+            self->m_state |= TEST_STATE_CLIENT_GOT_SERVER_UNAVAILABLE;
         } else if (status != UCS_OK) {
             self->m_state |= TEST_STATE_CLIENT_GOT_ERROR;
         } else {
@@ -740,7 +722,8 @@ protected:
 
         EXPECT_FALSE(m_state &
                      (TEST_STATE_SERVER_CONNECTED  | TEST_STATE_CLIENT_CONNECTED |
-                      TEST_STATE_CLIENT_GOT_REJECT | TEST_STATE_CLIENT_GOT_ERROR));
+                      TEST_STATE_CLIENT_GOT_REJECT | TEST_STATE_CLIENT_GOT_ERROR |
+                      TEST_STATE_CLIENT_GOT_SERVER_UNAVAILABLE));
 
         deadline = ucs_get_time() + ucs_time_from_sec(DEFAULT_TIMEOUT_SEC) *
                                     ucs::test_time_multiplier();
@@ -946,7 +929,6 @@ UCS_TEST_P(test_uct_cm_sockaddr, cm_server_reject)
     /* wrap errors since a reject is expected */
     scoped_log_handler slh(detect_reject_error_logger);
 
-    skip_tcp_sockcm();          /* reject for tcp_sockcm isn't implemented yet */
     listen_and_connect();
 
     wait_for_bits(&m_state, TEST_STATE_SERVER_REJECTED |
@@ -1006,11 +988,13 @@ UCS_TEST_P(test_uct_cm_sockaddr, err_handle)
     EXPECT_FALSE(m_state & TEST_STATE_CONNECT_REQUESTED);
 
     /* with the TCP port space (which is currently tested with rdmacm),
-     * a REJECT event will be generated on the client side.
+     * a REJECT event will be generated on the client side and since it's a
+     * reject from the network, it would be passed to upper layer as
+     * UCS_ERR_UNREACHABLE.
      * with tcp_sockcm, an EPOLLERR event will be generated and transformed
      * to an error code. */
-    wait_for_bits(&m_state, TEST_STATE_CLIENT_GOT_REJECT);
-    EXPECT_TRUE(ucs_test_all_flags(m_state, TEST_STATE_CLIENT_GOT_REJECT));
+    wait_for_bits(&m_state, TEST_STATE_CLIENT_GOT_SERVER_UNAVAILABLE);
+    EXPECT_TRUE(ucs_test_all_flags(m_state, TEST_STATE_CLIENT_GOT_SERVER_UNAVAILABLE));
 }
 
 UCS_TEST_P(test_uct_cm_sockaddr, conn_to_non_exist_server_port)
@@ -1028,11 +1012,13 @@ UCS_TEST_P(test_uct_cm_sockaddr, conn_to_non_exist_server_port)
                       client_connect_cb, client_disconnect_cb, this);
 
     /* with the TCP port space (which is currently tested with rdmacm),
-     * a REJECT event will be generated on the client side.
+     * a REJECT event will be generated on the client side and since it's a
+     * reject from the network, it would be passed to upper layer as
+     * UCS_ERR_UNREACHABLE.
      * with tcp_sockcm, an EPOLLERR event will be generated and transformed
      * to an error code. */
-    wait_for_bits(&m_state, TEST_STATE_CLIENT_GOT_REJECT);
-    EXPECT_TRUE(ucs_test_all_flags(m_state, TEST_STATE_CLIENT_GOT_REJECT));
+    wait_for_bits(&m_state, TEST_STATE_CLIENT_GOT_SERVER_UNAVAILABLE);
+    EXPECT_TRUE(ucs_test_all_flags(m_state, TEST_STATE_CLIENT_GOT_SERVER_UNAVAILABLE));
 }
 
 UCS_TEST_P(test_uct_cm_sockaddr, connect_client_to_server_with_delay)
@@ -1044,7 +1030,6 @@ UCS_TEST_P(test_uct_cm_sockaddr, connect_client_to_server_with_delay)
 
 UCS_TEST_P(test_uct_cm_sockaddr, connect_client_to_server_reject_with_delay)
 {
-    skip_tcp_sockcm();
     test_delayed_server_response(true);
 }
 
@@ -1116,7 +1101,7 @@ public:
          * for the connect() to fail when connecting to a non-existing ip.
          * A transport for which this value is not configurable, like rdmacm,
          * will have no effect. */
-        modify_config("SYN_CNT", "1", true);
+        modify_config("SYN_CNT", "1", SETENV_IF_NOT_EXIST);
 
         test_uct_cm_sockaddr::init();
     }
@@ -1151,8 +1136,8 @@ UCS_TEST_P(test_uct_cm_sockaddr_err_handle_non_exist_ip, conn_to_non_exist_ip)
         m_client->connect(0, *m_server, 0, m_connect_addr, client_priv_data_cb,
                           client_connect_cb, client_disconnect_cb, this);
 
-        wait_for_bits(&m_state, TEST_STATE_CLIENT_GOT_ERROR, 300);
-        EXPECT_TRUE(m_state & TEST_STATE_CLIENT_GOT_ERROR);
+        wait_for_bits(&m_state, TEST_STATE_CLIENT_GOT_SERVER_UNAVAILABLE, 300);
+        EXPECT_TRUE(m_state & TEST_STATE_CLIENT_GOT_SERVER_UNAVAILABLE);
 
         EXPECT_FALSE(m_state & TEST_STATE_CONNECT_REQUESTED);
         EXPECT_FALSE(m_state &
@@ -1430,8 +1415,6 @@ protected:
 
 UCS_TEST_P(test_uct_cm_sockaddr_multiple_cms, server_switch_cm)
 {
-    skip_tcp_sockcm();
-
     listen_and_connect();
 
     wait_for_bits(&m_state, TEST_STATE_SERVER_CONNECTED |

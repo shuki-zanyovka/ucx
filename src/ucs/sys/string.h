@@ -97,6 +97,24 @@ char *ucs_memunits_to_str(size_t value, char *buf, size_t max);
 
 
 /**
+ * Convert a pair of memory units values to a range string which is abbreviated
+ * if possible.
+ *
+ * For example:
+ *  1024, 4096 -> 1kb..4kb
+ *
+ * @param range_start  Range start value.
+ * @param range_end    Range end value.
+ * @param buf          Buffer to place the string.
+ * @param max          Maximal length of the buffer.
+ *
+ * @return Pointer to 'buf', which holds the resulting string.
+ */
+const char *ucs_memunits_range_str(size_t range_start, size_t range_end,
+                                   char *buf, size_t max);
+
+
+/**
  * Convert a string holding memory units to a numeric value.
  *
  *  @param buf   String to convert
@@ -196,6 +214,19 @@ const char *ucs_str_dump_hex(const void* data, size_t length, char *buf,
  */
 const char* ucs_flags_str(char *str, size_t max,
                           uint64_t flags, const char **str_table);
+
+
+/**
+ * Get estimated number of segments different in the two paths. Segments are
+ * separated by `/`.
+ *
+ * @param  path1  String pointing to first path
+ * @param  path2  String pointing to second path
+ *
+ * @return if either of the paths are invalid, UINT_MAX; if paths are the same 0
+ *         is returned; otherwise in between
+ */
+ssize_t ucs_path_calc_distance(const char *path1, const char *path2);
 
 
 /** Quantifier suffixes for memory units ("K", "M", "G", etc) */

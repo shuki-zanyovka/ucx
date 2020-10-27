@@ -103,9 +103,11 @@ ucs_status_t uct_ib_mlx5_completion_with_err(uct_ib_iface_t *iface,
         break;
     case MLX5_CQE_SYNDROME_REMOTE_ACCESS_ERR:
         snprintf(err_info, sizeof(err_info), "Remote access");
+        status = UCS_ERR_CONNECTION_RESET;
         break;
     case MLX5_CQE_SYNDROME_REMOTE_OP_ERR:
         snprintf(err_info, sizeof(err_info), "Remote QP");
+        status = UCS_ERR_CONNECTION_RESET;
         break;
     case MLX5_CQE_SYNDROME_TRANSPORT_RETRY_EXC_ERR:
         snprintf(err_info, sizeof(err_info), "Transport retry count exceeded");
@@ -204,51 +206,22 @@ static uint64_t network_to_host(void *ptr, int size)
         return *(uint64_t*)ptr;
     }
 }
+
 static size_t uct_ib_mlx5_dump_dgram(char *buf, size_t max, void *seg, int is_eth)
 {
     struct mlx5_wqe_datagram_seg *dgseg = seg;
-    struct mlx5_base_av *base_av;
+    struct mlx5_base_av *av;
     struct mlx5_grh_av *grh_av;
-    char gid_buf[32];
-    int sgid_index;
-    char *p, *endp;
+    uct_ib_mlx5_base_av_t base_av;
 
-    p       = buf;
-    endp    = buf + max - 1;
-    base_av = mlx5_av_base(&dgseg->av);
+    av     = mlx5_av_base(&dgseg->av);
+    grh_av = mlx5_av_grh(&dgseg->av);
 
-    snprintf(p, endp - p, " [rqpn 0x%x",
-             ntohl(base_av->dqp_dct & ~UCT_IB_MLX5_EXTENDED_UD_AV));
-    p += strlen(p);
+    UCT_IB_MLX5_SET_BASE_AV(&base_av, av);
+    uct_ib_mlx5_av_dump(buf, max, &base_av, grh_av, is_eth);
 
-    if (!is_eth) {
-        snprintf(p, endp - p, " rlid %d", ntohs(base_av->rlid));
-        p += strlen(p);
-    }
-
-    if (mlx5_av_base(&dgseg->av)->dqp_dct & UCT_IB_MLX5_EXTENDED_UD_AV) {
-        grh_av = mlx5_av_grh(&dgseg->av);
-        if (is_eth || (grh_av->grh_gid_fl & UCT_IB_MLX5_AV_GRH_PRESENT)) {
-            if (is_eth) {
-                snprintf(p, endp - p, " rmac %02x:%02x:%02x:%02x:%02x:%02x",
-                         grh_av->rmac[0], grh_av->rmac[1], grh_av->rmac[2],
-                         grh_av->rmac[3], grh_av->rmac[4], grh_av->rmac[5]);
-                p += strlen(p);
-            }
-
-            sgid_index = (htonl(grh_av->grh_gid_fl) >> 20) & UCS_MASK(8);
-            snprintf(p, endp - p,  " sgix %d dgid %s tc %d]", sgid_index,
-                     uct_ib_gid_str((union ibv_gid *)grh_av->rgid, gid_buf,
-                                    sizeof(gid_buf)),
-                     grh_av->tclass);
-        } else {
-            snprintf(p, endp - p, "]");
-        }
-        return UCT_IB_MLX5_AV_FULL_SIZE;
-    } else {
-        snprintf(p, endp - p, "]");
-        return UCT_IB_MLX5_AV_BASE_SIZE;
-    }
+    return (base_av.dqp_dct & UCT_IB_MLX5_EXTENDED_UD_AV) ?
+           UCT_IB_MLX5_AV_FULL_SIZE : UCT_IB_MLX5_AV_BASE_SIZE;
 }
 
 static int uct_ib_mlx5_is_qp_require_av_seg(int qp_type)
@@ -449,6 +422,48 @@ void uct_ib_mlx5_cqe_dump(const char *file, int line, const char *function, stru
     uct_log_data(file, line, function, buf);
 }
 
+void uct_ib_mlx5_av_dump(char *buf, size_t max,
+                         const uct_ib_mlx5_base_av_t *base_av,
+                         const struct mlx5_grh_av *grh_av, int is_eth)
+{
+    char gid_buf[32];
+    int sgid_index;
+    char *p, *endp;
+
+    p    = buf;
+    endp = buf + max - 1;
+
+    snprintf(p, endp - p, " [rqpn 0x%x",
+             ntohl(base_av->dqp_dct & ~UCT_IB_MLX5_EXTENDED_UD_AV));
+    p += strlen(p);
+
+    if (!is_eth) {
+        snprintf(p, endp - p, " rlid %d", ntohs(base_av->rlid));
+        p += strlen(p);
+    }
+
+    if (base_av->dqp_dct & UCT_IB_MLX5_EXTENDED_UD_AV) {
+        if (is_eth || (grh_av->grh_gid_fl & UCT_IB_MLX5_AV_GRH_PRESENT)) {
+            if (is_eth) {
+                snprintf(p, endp - p, " rmac %02x:%02x:%02x:%02x:%02x:%02x",
+                         grh_av->rmac[0], grh_av->rmac[1], grh_av->rmac[2],
+                         grh_av->rmac[3], grh_av->rmac[4], grh_av->rmac[5]);
+                p += strlen(p);
+            }
+
+            sgid_index = (htonl(grh_av->grh_gid_fl) >> 20) & UCS_MASK(8);
+            snprintf(p, endp - p,  " sgix %d dgid %s tc %d]", sgid_index,
+                     uct_ib_gid_str((union ibv_gid *)grh_av->rgid, gid_buf,
+                                    sizeof(gid_buf)),
+                     grh_av->tclass);
+        } else {
+            snprintf(p, endp - p, "]");
+        }
+    } else {
+        snprintf(p, endp - p, "]");
+    }
+}
+
 void __uct_ib_mlx5_log_rx(const char *file, int line, const char *function,
                           uct_ib_iface_t *iface, struct mlx5_cqe64 *cqe,
                           void *data, uct_log_data_dump_func_t packet_dump_cb)
@@ -456,7 +471,7 @@ void __uct_ib_mlx5_log_rx(const char *file, int line, const char *function,
     char buf[256] = {0};
     size_t length;
 
-    length = ntohl(cqe->byte_cnt);
+    length = ntohl(cqe->byte_cnt) & UCT_IB_MLX5_MP_RQ_BYTE_CNT_MASK;
     if (iface->config.qp_type == IBV_QPT_UD) {
         length -= UCT_IB_GRH_LEN;
         data    = UCS_PTR_BYTE_OFFSET(data, UCT_IB_GRH_LEN);

@@ -9,6 +9,7 @@
 #define UCS_SOCKET_H
 
 #include <ucs/type/status.h>
+#include <ucs/config/parser.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -20,6 +21,9 @@
 BEGIN_C_DECLS
 
 
+#define UCS_IPV4_ADDR_LEN            sizeof(struct in_addr)
+#define UCS_IPV6_ADDR_LEN            sizeof(struct in6_addr)
+
 /* A string to hold the IP address and port from a sockaddr */
 #define UCS_SOCKADDR_STRING_LEN      60
 
@@ -28,25 +32,6 @@ BEGIN_C_DECLS
 
 #define UCS_SOCKET_INET6_ADDR(_addr) (((struct sockaddr_in6*)(_addr))->sin6_addr)
 #define UCS_SOCKET_INET6_PORT(_addr) (((struct sockaddr_in6*)(_addr))->sin6_port)
-
-
-/**
- * Error callback to handle errno and status of a given socket IO operation.
- *
- * @param [in] arg       User's argument for the error callback.
- * @param [in] io_status Status set for a given IO operation.
- *
- * @return UCS_OK if error handling was done in the callback and no other
- *         actions are required from a caller (UCS_ERR_CANCELED will be
- *         returned as the result of the IO operation), UCS_ERR_NO_PROGRESS
- *         if error handling was done in the callback and the IO operation
- *         should be continued (UCS_ERR_NO_PROGRESS will be retuned as the
- *         result of the IO operation), otherwise - the default error handling
- *         should be done and the returned status will be the result of
- *         the IO operation.
- */
-typedef ucs_status_t (*ucs_socket_io_err_cb_t)(void *arg,
-                                               ucs_status_t io_status);
 
 
 /**
@@ -222,18 +207,24 @@ ucs_status_t ucs_socket_set_buffer_size(int fd, size_t sockopt_sndbuf,
  * Open a socket, bind a sockadrr to that socket and start listening on it for
  * incoming connection requests.
  *
- * @param [in]  saddr           Sockaddr for the server to listen on.
- *                              If the port number inside is set to zero -
- *                              use a random port.
- * @param [in]  socklen         Size of saddr.
- * @param [in]  backlog         Length of the queue for pending connections -
- *                              for the listen() call.
- * @param [out] listen_fd       The fd that belongs to the server.
+ * @param [in]  saddr             Sockaddr for the server to listen on.
+ *                                If the port number inside is set to zero -
+ *                                use a random port.
+ * @param [in]  socklen           Size of saddr.
+ * @param [in]  backlog           Length of the queue for pending connections -
+ *                                for the listen() call.
+ * @param [in]  silent_bind       Whether or not to print error message on bind
+ *                                failure with EADDRINUSE.
+ * @param [in]  allow_addr_inuse  Whether or not to allow the socket to use an
+ *                                address that is already in use and was not
+ *                                released by another socket yet.
+ * @param [out] listen_fd         The fd that belongs to the server.
  *
  * @return UCS_OK on success or an error code on failure.
  */
 ucs_status_t ucs_socket_server_init(const struct sockaddr *saddr, socklen_t socklen,
-                                    int backlog, int *listen_fd);
+                                    int backlog, int silent_bind, int allow_addr_inuse,
+                                    int *listen_fd);
 
 
 /**
@@ -257,19 +248,10 @@ int ucs_socket_max_conn();
  * @param [in/out]  length_p        The length, in bytes, of the data in buffer
  *                                  pointed to by the `data` parameter. The amount of
  *                                  data transmitted is written to this argument.
- * @param [in]      err_cb          Error callback.
- * @param [in]      err_cb_arg      User's argument for the error callback.
  *
- * @return UCS_OK on success, UCS_ERR_CANCELED if some error happened, but it
- *         was handled in a user's err_cb and no other actions are required,
- *         UCS_ERR_NO_PROGRESS if system call was interrupted or would block,
- *         UCS_ERR_NOT_CONNECTED if the connection was destroyed,
- *         UCS_ERR_IO_ERROR on failure, or any other errors returned from a
- *         user's error callback.
+ * @return UCS_OK on success or an error code on failure.
  */
-ucs_status_t ucs_socket_send_nb(int fd, const void *data, size_t *length_p,
-                                ucs_socket_io_err_cb_t err_cb,
-                                void *err_cb_arg);
+ucs_status_t ucs_socket_send_nb(int fd, const void *data, size_t *length_p);
 
 
 /**
@@ -282,19 +264,10 @@ ucs_status_t ucs_socket_send_nb(int fd, const void *data, size_t *length_p,
  * @param [in/out]  length_p        The length, in bytes, of the data in buffer
  *                                  pointed to by the `data` parameter. The amount of
  *                                  data received is written to this argument.
- * @param [in]      err_cb          Error callback.
- * @param [in]      err_cb_arg      User's argument for the error callback.
  *
- * @return UCS_OK on success, UCS_ERR_CANCELED if some error happened, but it
- *         was handled in user's err_cb and no other actions are required,
- *         UCS_ERR_NO_PROGRESS if system call was interrupted or would block,
- *         UCS_ERR_NOT_CONNECTED if the connection was destroyed,
- *         UCS_ERR_IO_ERROR on failure, or any other errors returned from a
- *         user's error callback.
+ * @return UCS_OK on success or an error code on failure.
  */
-ucs_status_t ucs_socket_recv_nb(int fd, void *data, size_t *length_p,
-                                ucs_socket_io_err_cb_t err_cb,
-                                void *err_cb_arg);
+ucs_status_t ucs_socket_recv_nb(int fd, void *data, size_t *length_p);
 
 
 /**
@@ -306,18 +279,10 @@ ucs_status_t ucs_socket_recv_nb(int fd, void *data, size_t *length_p,
  *                                  be transmitted.
  * @param [in/out]  length          The length, in bytes, of the data in buffer
  *                                  pointed to by the `data` parameter.
- * @param [in]      err_cb          Error callback.
- * @param [in]      err_cb_arg      User's argument for the error callback.
  *
- * @return UCS_OK on success, UCS_ERR_CANCELED if some error happened, but it
- *         was handled in user's err_cb and no other actions are required,
- *         UCS_ERR_NOT_CONNECTED if the connection was destroyed,
- *         UCS_ERR_IO_ERROR on failure, or any other errors returned from a
- *         user's error callback.
+ * @return UCS_OK on success or an error code on failure.
  */
-ucs_status_t ucs_socket_send(int fd, const void *data, size_t length,
-                             ucs_socket_io_err_cb_t err_cb,
-                             void *err_cb_arg);
+ucs_status_t ucs_socket_send(int fd, const void *data, size_t length);
 
 
 /**
@@ -330,19 +295,11 @@ ucs_status_t ucs_socket_send(int fd, const void *data, size_t length,
  *                                  the iov parameter.
  * @param [out]     length_p        The amount of data transmitted is written to
  *                                  this argument.
- * @param [in]      err_cb          Error callback.
- * @param [in]      err_cb_arg      User's argument for the error callback.
  *
- * @return UCS_OK on success, UCS_ERR_CANCELED if some error happened, but it
- *         was handled in user's err_cb and no other actions are required,
- *         UCS_ERR_NO_PROGRESS if system call was interrupted or would block,
- *         UCS_ERR_NOT_CONNECTED if the connection was destroyed,
- *         UCS_ERR_IO_ERROR on failure, or any other errors returned from a
- *         user's error callback.
+ * @return UCS_OK on success or an error code on failure.
  */
 ucs_status_t ucs_socket_sendv_nb(int fd, struct iovec *iov, size_t iov_cnt,
-                                 size_t *length_p, ucs_socket_io_err_cb_t err_cb,
-                                 void *err_cb_arg);
+                                 size_t *length_p);
 
 
 /**
@@ -354,18 +311,10 @@ ucs_status_t ucs_socket_sendv_nb(int fd, struct iovec *iov, size_t iov_cnt,
  *                                  data.
  * @param [in/out]  length          The length, in bytes, of the data in buffer
  *                                  pointed to by the `data` paramete.
- * @param [in]      err_cb          Error callback.
- * @param [in]      err_cb_arg      User's argument for the error callback.
  *
- * @return UCS_OK on success, UCS_ERR_CANCELED if some error happened, but it
- *         was handled in user's err_cb and no other actions are required,
- *         UCS_ERR_NOT_CONNECTED if the connection was destroyed,
- *         UCS_ERR_IO_ERROR on failure, or any other errors returned from a
- *         user's error callback.
+ * @return UCS_OK on success or an error code on failure.
  */
-ucs_status_t ucs_socket_recv(int fd, void *data, size_t length,
-                             ucs_socket_io_err_cb_t err_cb,
-                             void *err_cb_arg);
+ucs_status_t ucs_socket_recv(int fd, void *data, size_t length);
 
 
 /**
@@ -519,6 +468,16 @@ ucs_status_t ucs_sockaddr_get_ifname(int fd, char *ifname_str, size_t max_strlen
  * Only IPv4 and IPv6 conversions are supported.
  */
 const char *ucs_sockaddr_address_family_str(sa_family_t af);
+
+
+/**
+ * Get the local ports range.
+ *
+ * @param [out]  port_range     Pointer to a struct holding the ports range.
+ *
+ * @return UCS_OK or error in case of failure.
+ */
+ucs_status_t ucs_sockaddr_get_ip_local_port_range(ucs_range_spec_t *port_range);
 
 END_C_DECLS
 

@@ -19,6 +19,9 @@
 #include <ucs/debug/log.h>
 
 
+const ucp_request_param_t ucp_request_null_param = { .op_attr_mask = 0 };
+
+
 int ucp_request_is_completed(void *request)
 {
     ucp_request_t *req = (ucp_request_t*)request - 1;
@@ -42,7 +45,7 @@ ucs_status_t ucp_tag_recv_request_test(void *request, ucp_tag_recv_info_t *info)
     ucs_status_t  status = ucp_request_check_status(request);
 
     if (status != UCS_INPROGRESS) {
-        ucs_assert(req->flags & UCP_REQUEST_FLAG_RECV);
+        ucs_assert(req->flags & UCP_REQUEST_FLAG_RECV_TAG);
         *info = req->recv.tag.info;
     }
 
@@ -166,8 +169,7 @@ ucs_mpool_ops_t ucp_rndv_get_mpool_ops = {
     .obj_cleanup   = NULL
 };
 
-int ucp_request_pending_add(ucp_request_t *req, ucs_status_t *req_status,
-                            unsigned pending_flags)
+int ucp_request_pending_add(ucp_request_t *req, unsigned pending_flags)
 {
     ucs_status_t status;
     uct_ep_h uct_ep;
@@ -180,7 +182,6 @@ int ucp_request_pending_add(ucp_request_t *req, ucs_status_t *req_status,
     if (status == UCS_OK) {
         ucs_trace_data("ep %p: added pending uct request %p to lane[%d]=%p",
                        req->send.ep, req, req->send.lane, uct_ep);
-        *req_status            = UCS_INPROGRESS;
         req->send.pending_lane = req->send.lane;
         return 1;
     } else if (status == UCS_ERR_BUSY) {
@@ -220,8 +221,9 @@ UCS_PROFILE_FUNC(ucs_status_t, ucp_request_memory_reg,
     int flags;
     int level;
 
-    ucs_trace_func("context=%p md_map=0x%lx buffer=%p length=%zu datatype=0x%lu "
-                   "state=%p", context, md_map, buffer, length, datatype, state);
+    ucs_trace_func("context=%p md_map=0x%"PRIx64" buffer=%p length=%zu "
+                   "datatype=0x%"PRIx64" state=%p", context, md_map, buffer,
+                   length, datatype, state);
 
     status = UCS_OK;
     flags  = UCT_MD_MEM_ACCESS_RMA | uct_flags;
@@ -265,7 +267,7 @@ UCS_PROFILE_FUNC(ucs_status_t, ucp_request_memory_reg,
         break;
     default:
         status = UCS_ERR_INVALID_PARAM;
-        ucs_error("Invalid data type %lx", datatype);
+        ucs_error("Invalid data type 0x%"PRIx64, datatype);
     }
 
 err:
@@ -273,8 +275,9 @@ err:
         level = (flags & UCT_MD_MEM_FLAG_HIDE_ERRORS) ?
                 UCS_LOG_LEVEL_DEBUG : UCS_LOG_LEVEL_ERROR;
         ucs_log(level,
-                "failed to register user buffer datatype 0x%lx address %p len %zu:"
-                " %s", datatype, buffer, length, ucs_status_string(status));
+                "failed to register user buffer datatype 0x%"PRIx64
+                " address %p len %zu: %s", datatype, buffer, length,
+                ucs_status_string(status));
     }
     return status;
 }
@@ -283,8 +286,8 @@ UCS_PROFILE_FUNC_VOID(ucp_request_memory_dereg, (context, datatype, state, req_d
                       ucp_context_t *context, ucp_datatype_t datatype,
                       ucp_dt_state_t *state, ucp_request_t *req_dbg)
 {
-    ucs_trace_func("context=%p datatype=0x%lu state=%p", context, datatype,
-                   state);
+    ucs_trace_func("context=%p datatype=0x%"PRIx64" state=%p", context,
+                   datatype, state);
 
     switch (datatype & UCP_DATATYPE_CLASS_MASK) {
     case UCP_DATATYPE_CONTIG:
@@ -309,7 +312,7 @@ ucs_status_t ucp_request_test(void *request, ucp_tag_recv_info_t *info)
     ucp_request_t *req = (ucp_request_t*)request - 1;
 
     if (req->flags & UCP_REQUEST_FLAG_COMPLETED) {
-        if (req->flags & UCP_REQUEST_FLAG_RECV) {
+        if (req->flags & UCP_REQUEST_FLAG_RECV_TAG) {
             *info = req->recv.tag.info;
         }
         ucs_assert(req->status != UCS_INPROGRESS);
@@ -327,8 +330,8 @@ void ucp_request_init_multi_proto(ucp_request_t *req,
 
     if (req->flags & (UCP_REQUEST_FLAG_SEND_TAG |
                       UCP_REQUEST_FLAG_SEND_AM)) {
-        req->send.msg_proto.message_id  = req->send.ep->worker->am_message_id++;
-        req->send.msg_proto.am_bw_index = 0;
+        req->send.msg_proto.message_id = req->send.ep->worker->am_message_id++;
+        req->send.am_bw_index          = 0;
     }
 
     req->send.pending_lane = UCP_NULL_LANE;
@@ -337,13 +340,15 @@ void ucp_request_init_multi_proto(ucp_request_t *req,
 
 ucs_status_t
 ucp_request_send_start(ucp_request_t *req, ssize_t max_short,
-                       size_t zcopy_thresh, size_t zcopy_max, size_t dt_count,
-                       const ucp_ep_msg_config_t* msg_config,
+                       size_t zcopy_thresh, size_t zcopy_max,
+                       size_t dt_count, size_t priv_iov_count,
+                       size_t length, const ucp_ep_msg_config_t* msg_config,
                        const ucp_request_send_proto_t *proto)
 {
-    size_t       length = req->send.length;
     ucs_status_t status;
     int          multi;
+
+    req->status = UCS_INPROGRESS;
 
     if ((ssize_t)length <= max_short) {
         /* short */
@@ -374,11 +379,11 @@ ucp_request_send_start(ucp_request_t *req, ssize_t max_short,
         if (ucs_unlikely(length > msg_config->max_zcopy - proto->only_hdr_size)) {
             multi = 1;
         } else if (ucs_unlikely(UCP_DT_IS_IOV(req->send.datatype))) {
-            if (dt_count <= msg_config->max_iov) {
+            if (dt_count <= (msg_config->max_iov - priv_iov_count)) {
                 multi = 0;
             } else {
                 multi = ucp_dt_iov_count_nonempty(req->send.buffer, dt_count) >
-                        msg_config->max_iov;
+                        (msg_config->max_iov - priv_iov_count);
             }
         } else {
             multi = 0;
@@ -407,9 +412,10 @@ void ucp_request_send_state_ff(ucp_request_t *req, ucs_status_t status)
     if (req->send.state.uct_comp.func == ucp_ep_flush_completion) {
         ucp_ep_flush_request_ff(req, status);
     } else if (req->send.state.uct_comp.func) {
-        req->send.state.dt.offset = req->send.length;
+        req->send.state.dt.offset      = req->send.length;
         req->send.state.uct_comp.count = 0;
-        req->send.state.uct_comp.func(&req->send.state.uct_comp, status);
+        uct_completion_update_status(&req->send.state.uct_comp, status);
+        req->send.state.uct_comp.func(&req->send.state.uct_comp);
     } else {
         ucp_request_complete_send(req, status);
     }
@@ -424,12 +430,10 @@ ucs_status_t ucp_request_recv_msg_truncated(ucp_request_t *req, size_t length,
               length, offset, req->recv.length);
 
     if (UCP_DT_IS_GENERIC(req->recv.datatype)) {
-        dt_gen = ucp_dt_generic(req->recv.datatype);
+        dt_gen = ucp_dt_to_generic(req->recv.datatype);
         UCS_PROFILE_NAMED_CALL_VOID("dt_finish", dt_gen->ops.finish,
                                     req->recv.state.dt.generic.state);
     }
 
     return UCS_ERR_MESSAGE_TRUNCATED;
 }
-
-

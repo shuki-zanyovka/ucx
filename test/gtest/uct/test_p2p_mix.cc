@@ -22,9 +22,9 @@ ucs_status_t uct_p2p_mix_test::am_callback(void *arg, void *data, size_t length,
     return UCS_OK;
 }
 
-void uct_p2p_mix_test::completion_callback(uct_completion_t *comp, ucs_status_t status)
+void uct_p2p_mix_test::completion_callback(uct_completion_t *comp)
 {
-    EXPECT_UCS_OK(status);
+    EXPECT_UCS_OK(comp->status);
 }
 
 template <typename T, uct_atomic_op_t OP>
@@ -118,9 +118,10 @@ void uct_p2p_mix_test::random_op(const mapped_buffer &sendbuf,
     ucs_status_t status;
     int op;
 
-    op         = ucs::rand() % m_avail_send_funcs.size();
-    comp.count = 1;
-    comp.func  = completion_callback;
+    op          = ucs::rand() % m_avail_send_funcs.size();
+    comp.count  = 1;
+    comp.status = UCS_OK;
+    comp.func   = completion_callback;
 
     for (;;) {
         status = (this->*m_avail_send_funcs[op])(sendbuf, recvbuf, &comp);
@@ -144,7 +145,7 @@ void uct_p2p_mix_test::run(unsigned count) {
     if (m_avail_send_funcs.size() == 0) {
         UCS_TEST_SKIP_R("unsupported");
     }
-    if (sender().md_attr().cap.access_mem_type != UCS_MEMORY_TYPE_HOST) {
+    if (!(sender().md_attr().cap.access_mem_types & UCS_BIT(UCS_MEMORY_TYPE_HOST))) {
         UCS_TEST_SKIP_R("skipping on non-host memory");
     }
 

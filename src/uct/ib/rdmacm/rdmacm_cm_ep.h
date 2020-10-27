@@ -34,6 +34,22 @@ enum {
                                                                uct_rdmacm_cm_ep_t::status.*/
 };
 
+
+static UCS_F_ALWAYS_INLINE
+uct_rdmacm_cm_t *uct_rdmacm_cm_ep_get_cm(uct_rdmacm_cm_ep_t *cep)
+{
+    /* return the rdmacm connection manager this ep is using */
+    return ucs_container_of(cep->super.super.super.iface, uct_rdmacm_cm_t,
+                            super.iface);
+}
+
+
+static UCS_F_ALWAYS_INLINE
+ucs_async_context_t *uct_rdmacm_cm_ep_get_async(uct_rdmacm_cm_ep_t *cep)
+{
+    return uct_rdmacm_cm_get_async(uct_rdmacm_cm_ep_get_cm(cep));
+}
+
 UCS_CLASS_DECLARE_NEW_FUNC(uct_rdmacm_cm_ep_t, uct_ep_t, const uct_ep_params_t *);
 UCS_CLASS_DECLARE_DELETE_FUNC(uct_rdmacm_cm_ep_t, uct_ep_t);
 
@@ -41,12 +57,12 @@ ucs_status_t uct_rdmacm_cm_ep_disconnect(uct_ep_h ep, unsigned flags);
 
 ucs_status_t uct_rdmacm_cm_ep_conn_notify(uct_ep_h ep);
 
+ucs_status_t uct_rdmacm_cm_ep_pack_cb(uct_rdmacm_cm_ep_t *cep,
+                                      struct rdma_conn_param *conn_param);
+
 ucs_status_t
 uct_rdamcm_cm_ep_set_qp_num(struct rdma_conn_param *conn_param,
                             uct_rdmacm_cm_ep_t *cep);
-
-ucs_status_t uct_rdmacm_cm_ep_conn_param_init(uct_rdmacm_cm_ep_t *cep,
-                                              struct rdma_conn_param *conn_param);
 
 void uct_rdmacm_cm_ep_error_cb(uct_rdmacm_cm_ep_t *cep,
                                uct_cm_remote_data_t *remote_data,

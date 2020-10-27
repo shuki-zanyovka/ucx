@@ -8,7 +8,8 @@
 #include <ifaddrs.h>
 
 extern "C" {
-#include <ucp/core/ucp_worker.h>
+#include <ucp/core/ucp_worker.inl>
+#include <ucp/core/ucp_ep.inl>
 #if HAVE_IB
 #include <uct/ib/ud/base/ud_iface.h>
 #endif
@@ -159,13 +160,13 @@ void ucp_test::short_progress_loop(int worker_index) const {
 void ucp_test::flush_ep(const entity &e, int worker_index, int ep_index)
 {
     void *request = e.flush_ep_nb(worker_index, ep_index);
-    wait(request, worker_index);
+    request_wait(request, worker_index);
 }
 
 void ucp_test::flush_worker(const entity &e, int worker_index)
 {
     void *request = e.flush_worker_nb(worker_index);
-    wait(request, worker_index);
+    request_wait(request, worker_index);
 }
 
 void ucp_test::disconnect(entity& e) {
@@ -189,32 +190,51 @@ void ucp_test::disconnect(entity& e) {
     }
 }
 
-void ucp_test::wait(void *req, int worker_index)
+ucs_status_t ucp_test::request_process(void *req, int worker_index, bool wait)
 {
     if (req == NULL) {
-        return;
+        return UCS_OK;
     }
 
     if (UCS_PTR_IS_ERR(req)) {
         ucs_error("operation returned error: %s",
                   ucs_status_string(UCS_PTR_STATUS(req)));
-        return;
+        return UCS_PTR_STATUS(req);
     }
 
     ucs_status_t status;
-    ucs_time_t deadline = ucs::get_deadline();
-    do {
-        progress(worker_index);
+    if (wait) {
+        ucs_time_t deadline = ucs::get_deadline();
+        do {
+            progress(worker_index);
+            status = ucp_request_check_status(req);
+        } while ((status == UCS_INPROGRESS) && (ucs_get_time() < deadline));
+    } else {
         status = ucp_request_check_status(req);
-    } while ((status == UCS_INPROGRESS) && (ucs_get_time() < deadline));
+    }
 
-    if (status != UCS_OK) {
+    if (status == UCS_INPROGRESS) {
+        if (wait) {
+            ucs_error("request %p did not complete on time", req);
+        }
+    } else if (status != UCS_OK) {
         /* UCS errors are suppressed in case of error handling tests */
         ucs_error("request %p completed with error %s", req,
                   ucs_status_string(status));
     }
 
     ucp_request_release(req);
+    return status;
+}
+
+ucs_status_t ucp_test::request_wait(void *req, int worker_index)
+{
+    return request_process(req, worker_index, true);
+}
+
+void ucp_test::request_release(void *req)
+{
+    request_process(req, 0, false);
 }
 
 void ucp_test::set_ucp_config(ucp_config_t *config) {
@@ -287,13 +307,13 @@ void ucp_test::set_ucp_config(ucp_config_t *config,
 }
 
 void ucp_test::modify_config(const std::string& name, const std::string& value,
-                             bool optional)
+                             modify_config_mode_t mode)
 {
     ucs_status_t status;
 
     status = ucp_config_modify(m_ucp_config, name.c_str(), value.c_str());
     if (status == UCS_ERR_NO_ELEM) {
-        test_base::modify_config(name, value, optional);
+        test_base::modify_config(name, value, mode);
     } else if (status != UCS_OK) {
         UCS_TEST_ABORT("Couldn't modify ucp config parameter: " <<
                         name.c_str() << " to " << value.c_str() << ": " <<
@@ -828,6 +848,24 @@ void ucp_test_base::entity::ep_destructor(ucp_ep_h ep, entity *e)
     } while (status == UCS_INPROGRESS);
     EXPECT_EQ(UCS_OK, status);
     ucp_request_release(req);
+}
+
+bool ucp_test_base::entity::has_lane_with_caps(uint64_t caps) const
+{
+    ucp_ep_h ep         = this->ep();
+    ucp_worker_h worker = this->worker();
+    ucp_lane_index_t lane;
+    uct_iface_attr_t *iface_attr;
+
+    for (lane = 0; lane < ucp_ep_config(ep)->key.num_lanes; lane++) {
+        iface_attr = ucp_worker_iface_get_attr(worker,
+                                               ucp_ep_config(ep)->key.lanes[lane].rsc_index);
+        if (ucs_test_all_flags(iface_attr->cap.flags, caps)) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 bool ucp_test_base::is_request_completed(void *request) {

@@ -42,6 +42,7 @@
 #define COMM_TYPE_DEFAULT      "STREAM"
 #define PRINT_INTERVAL         2000
 #define DEFAULT_NUM_ITERATIONS 1
+#define TEST_AM_ID             0
 
 const  char test_message[]           = "UCX Client-Server Hello World";
 static uint16_t server_port          = DEFAULT_PORT;
@@ -51,6 +52,7 @@ static int num_iterations            = DEFAULT_NUM_ITERATIONS;
 typedef enum {
     CLIENT_SERVER_SEND_RECV_STREAM  = UCS_BIT(0),
     CLIENT_SERVER_SEND_RECV_TAG     = UCS_BIT(1),
+    CLIENT_SERVER_SEND_RECV_AM      = UCS_BIT(2),
     CLIENT_SERVER_SEND_RECV_DEFAULT = CLIENT_SERVER_SEND_RECV_STREAM
 } send_recv_type_t;
 
@@ -76,38 +78,63 @@ typedef struct test_req {
 
 
 /**
+ * Descriptor of the data received with AM API.
+ */
+static struct {
+    volatile int complete;
+    int          is_rndv;
+    void         *desc;
+    void         *recv_buf;
+} am_data_desc = {0, 0, NULL, NULL};
+
+
+/**
  * Print this application's usage help message.
  */
 static void usage(void);
 
 static void tag_recv_cb(void *request, ucs_status_t status,
-                        ucp_tag_recv_info_t *info)
+                        const ucp_tag_recv_info_t *info, void *user_data)
 {
-    test_req_t *req = request;
+    test_req_t *ctx = user_data;
 
-    req->complete = 1;
+    ctx->complete = 1;
 }
 
 /**
  * The callback on the receiving side, which is invoked upon receiving the
  * stream message.
  */
-static void stream_recv_cb(void *request, ucs_status_t status, size_t length)
+static void
+stream_recv_cb(void *request, ucs_status_t status, size_t length,
+               void *user_data)
 {
-    test_req_t *req = request;
+    test_req_t *ctx = user_data;
 
-    req->complete = 1;
+    ctx->complete = 1;
+}
+
+/**
+ * The callback on the receiving side, which is invoked upon receiving the
+ * active message.
+ */
+static void am_recv_cb(void *request, ucs_status_t status, size_t length,
+                       void *user_data)
+{
+    test_req_t *ctx = user_data;
+
+    ctx->complete = 1;
 }
 
 /**
  * The callback on the sending side, which is invoked after finishing sending
  * the message.
  */
-static void send_cb(void *request, ucs_status_t status)
+static void send_cb(void *request, ucs_status_t status, void *user_data)
 {
-    test_req_t *req = request;
+    test_req_t *ctx = user_data;
 
-    req->complete = 1;
+    ctx->complete = 1;
 }
 
 /**
@@ -212,7 +239,8 @@ static void print_result(int is_server, char *recv_message, int current_iter)
 /**
  * Progress the request until it completes.
  */
-static ucs_status_t request_wait(ucp_worker_h ucp_worker, test_req_t *request)
+static ucs_status_t request_wait(ucp_worker_h ucp_worker, void *request,
+                                 test_req_t *ctx)
 {
     ucs_status_t status;
 
@@ -225,25 +253,24 @@ static ucs_status_t request_wait(ucp_worker_h ucp_worker, test_req_t *request)
         return UCS_PTR_STATUS(request);
     }
     
-    while (request->complete == 0) {
+    while (ctx->complete == 0) {
         ucp_worker_progress(ucp_worker);
     }
     status = ucp_request_check_status(request);
 
-    /* This request may be reused so initialize it for next time */
-    request->complete = 0;
     ucp_request_free(request);
 
     return status;
 }
 
 static int request_finalize(ucp_worker_h ucp_worker, test_req_t *request,
-                            int is_server, char *recv_message, int current_iter)
+                            test_req_t *ctx, int is_server,
+                            char *recv_message, int current_iter)
 {
     ucs_status_t status;
     int ret = 0;
 
-    status = request_wait(ucp_worker, request);
+    status = request_wait(ucp_worker, request, ctx);
     if (status != UCS_OK) {
         fprintf(stderr, "unable to %s UCX message (%s)\n",
                 is_server ? "receive": "send", ucs_status_string(status));
@@ -268,24 +295,32 @@ static int send_recv_stream(ucp_worker_h ucp_worker, ucp_ep_h ep, int is_server,
                             int current_iter)
 {
     char recv_message[TEST_STRING_LEN]= "";
+    ucp_request_param_t param;
     test_req_t *request;
     size_t length;
+    test_req_t ctx;
 
+    ctx.complete = 0;
+    param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+                         UCP_OP_ATTR_FIELD_USER_DATA;
+    param.user_data    = &ctx;
     if (!is_server) {
         /* Client sends a message to the server using the stream API */
-        request = ucp_stream_send_nb(ep, test_message, 1,
-                                     ucp_dt_make_contig(TEST_STRING_LEN),
-                                     send_cb, 0);
+        param.cb.send = send_cb;
+        request       = ucp_stream_send_nbx(ep, test_message, TEST_STRING_LEN,
+                                            &param);
     } else {
         /* Server receives a message from the client using the stream API */
-        request = ucp_stream_recv_nb(ep, &recv_message, 1,
-                                     ucp_dt_make_contig(TEST_STRING_LEN),
-                                     stream_recv_cb, &length,
-                                     UCP_STREAM_RECV_FLAG_WAITALL);
+        param.op_attr_mask  |= UCP_OP_ATTR_FIELD_FLAGS;
+        param.flags          = UCP_STREAM_RECV_FLAG_WAITALL;
+        param.cb.recv_stream = stream_recv_cb;
+        request              = ucp_stream_recv_nbx(ep, &recv_message,
+                                                   TEST_STRING_LEN,
+                                                   &length, &param);
     }
 
-    return request_finalize(ucp_worker, request, is_server, recv_message,
-                            current_iter);
+    return request_finalize(ucp_worker, request, &ctx, is_server,
+                            recv_message, current_iter);
 }
 
 /**
@@ -297,21 +332,116 @@ static int send_recv_tag(ucp_worker_h ucp_worker, ucp_ep_h ep, int is_server,
                          int current_iter)
 {
     char recv_message[TEST_STRING_LEN]= "";
-    test_req_t *request;
+    ucp_request_param_t param;
+    void *request;
+    test_req_t ctx;
 
+    ctx.complete = 0;
+    param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+                         UCP_OP_ATTR_FIELD_USER_DATA;
+    param.user_data    = &ctx;
     if (!is_server) {
         /* Client sends a message to the server using the Tag-Matching API */
-        request = ucp_tag_send_nb(ep, test_message, 1,
-                                  ucp_dt_make_contig(TEST_STRING_LEN), TAG,
-                                  send_cb);
+        param.cb.send = send_cb;
+        request       = ucp_tag_send_nbx(ep, test_message, TEST_STRING_LEN,
+                                         TAG, &param);
     } else {
         /* Server receives a message from the client using the Tag-Matching API */
-        request = ucp_tag_recv_nb(ucp_worker, &recv_message, 1,
-                                  ucp_dt_make_contig(TEST_STRING_LEN),
-                                  TAG, 0, tag_recv_cb);
+        param.cb.recv = tag_recv_cb;
+        request       = ucp_tag_recv_nbx(ucp_worker, &recv_message,
+                                         TEST_STRING_LEN, TAG, 0, &param);
     }
 
-    return request_finalize(ucp_worker, request, is_server, recv_message,
+    return request_finalize(ucp_worker, request, &ctx, is_server, recv_message,
+                            current_iter);
+}
+
+ucs_status_t ucp_am_data_cb(void *arg, const void *header, size_t header_length,
+                            void *data, size_t length,
+                            const ucp_am_recv_param_t *param)
+{
+    if (length != TEST_STRING_LEN) {
+        fprintf(stderr, "received wrong data length %ld (expected %ld)",
+                length, TEST_STRING_LEN);
+        goto out;
+    }
+
+    if ((header != NULL) || (header_length != 0)) {
+        fprintf(stderr, "received unexpected header, length %ld", header_length);
+    }
+
+    if (param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) {
+        /* Rendezvous request arrived, data contains an internal UCX descriptor,
+         * which has to be passed to ucp_am_recv_data_nbx function to confirm
+         * data transfer.
+         */
+        am_data_desc.is_rndv = 1;
+        am_data_desc.desc    = data;
+        return UCS_INPROGRESS;
+    }
+
+    /* Message delivered with eager protocol, data should be available
+     * immediately
+     */
+    am_data_desc.is_rndv = 0;
+    memcpy(am_data_desc.recv_buf, data, length);
+
+out:
+    am_data_desc.complete = 1;
+    return UCS_OK;
+}
+
+/**
+ * Send and receive a message using Active Message API.
+ * The client sends a message to the server and waits until the send is completed.
+ * The server gets a message from the client and if it is rendezvous request,
+ * initiates receive operation.
+ */
+static int send_recv_am(ucp_worker_h ucp_worker, ucp_ep_h ep, int is_server,
+                        int current_iter)
+{
+    char recv_message[TEST_STRING_LEN] = "";
+    test_req_t *request;
+    ucp_request_param_t params;
+    test_req_t ctx;
+
+    am_data_desc.recv_buf = recv_message;
+    ctx.complete          = 0;
+    params.op_attr_mask   = UCP_OP_ATTR_FIELD_CALLBACK |
+                            UCP_OP_ATTR_FIELD_USER_DATA;
+    params.user_data      = &ctx;
+
+    if (is_server) {
+        while (!am_data_desc.complete) {
+            ucp_worker_progress(ucp_worker);
+        }
+        am_data_desc.complete = 0;
+
+        if (am_data_desc.is_rndv) {
+            /* Rendezvous request has arrived, need to invoke receive operation
+             * to confirm data transfer from the sender to the "recv_message"
+             * buffer. */
+            params.op_attr_mask |= UCP_OP_ATTR_FLAG_NO_IMM_CMPL;
+            params.cb.recv_am    = am_recv_cb,
+            request              = ucp_am_recv_data_nbx(ucp_worker,
+                                                        am_data_desc.desc,
+                                                        &recv_message,
+                                                        TEST_STRING_LEN,
+                                                        &params);
+        } else {
+            /* Data has arrived eagerly and is ready for use, no need to
+             * initiate receive operation. */
+            request = NULL;
+        }
+    } else {
+        /* Client sends a message to the server using the AM API */
+        params.cb.send = (ucp_send_nbx_callback_t)send_cb,
+        request        = ucp_am_send_nbx(ep, TEST_AM_ID, NULL, 0ul,
+                                         test_message, TEST_STRING_LEN,
+                                         &params);
+    }
+
+    return request_finalize(ucp_worker, request, &ctx, is_server, recv_message,
                             current_iter);
 }
 
@@ -323,10 +453,13 @@ static int send_recv_tag(ucp_worker_h ucp_worker, ucp_ep_h ep, int is_server,
  */
 static void ep_close(ucp_worker_h ucp_worker, ucp_ep_h ep)
 {
+    ucp_request_param_t param;
     ucs_status_t status;
     void *close_req;
 
-    close_req = ucp_ep_close_nb(ep, UCP_EP_CLOSE_MODE_FORCE);
+    param.op_attr_mask = UCP_OP_ATTR_FIELD_FLAGS;
+    param.flags        = UCP_EP_CLOSE_FLAG_FORCE;
+    close_req          = ucp_ep_close_nbx(ep, &param);
     if (UCS_PTR_IS_PTR(close_req)) {
         do {
             ucp_worker_progress(ucp_worker);
@@ -337,15 +470,6 @@ static void ep_close(ucp_worker_h ucp_worker, ucp_ep_h ep)
     } else if (UCS_PTR_STATUS(close_req) != UCS_OK) {
         fprintf(stderr, "failed to close ep %p\n", (void*)ep);
     }
-}
-
-/**
- * A callback to be invoked by UCX in order to initialize the user's request.
- */
-static void request_init(void *request)
-{
-    test_req_t *req = request;
-    req->complete = 0;
 }
 
 /**
@@ -369,6 +493,7 @@ static void usage()
                     " Valid values are:\n"
                     "     'stream' : Stream API\n"
                     "     'tag'    : Tag API\n"
+                    "     'am'     : AM API\n"
                     "    If not specified, %s API will be used.\n", COMM_TYPE_DEFAULT);
     fprintf(stderr, " -i Number of iterations to run. Client and server must "
                     "have the same value. (default = %d).\n",
@@ -397,6 +522,11 @@ static int parse_cmd(int argc, char *const argv[], char **server_addr,
                 *send_recv_type = CLIENT_SERVER_SEND_RECV_STREAM;
             } else if (!strcasecmp(optarg, "tag")) {
                 *send_recv_type = CLIENT_SERVER_SEND_RECV_TAG;
+            } else if (!strcasecmp(optarg, "am")) {
+                /* TODO: uncomment below when AM API is fully supported.
+                 * *send_recv_type = CLIENT_SERVER_SEND_RECV_AM; */
+                fprintf(stderr, "AM API is not fully supported yet\n");
+                return -1;
             } else {
                 fprintf(stderr, "Wrong communication type %s. "
                         "Using %s as default\n", optarg, COMM_TYPE_DEFAULT);
@@ -480,6 +610,10 @@ static int client_server_communication(ucp_worker_h worker, ucp_ep_h ep,
     case CLIENT_SERVER_SEND_RECV_TAG:
         /* Client-Server communication via Tag-Matching API */
         ret = send_recv_tag(worker, ep, is_server, current_iter);
+        break;
+    case CLIENT_SERVER_SEND_RECV_AM:
+        /* Client-Server communication via AM API. */
+        ret = send_recv_am(worker, ep, is_server, current_iter);
         break;
     default:
         fprintf(stderr, "unknown send-recv type %d\n", send_recv_type);
@@ -650,6 +784,7 @@ static int run_server(ucp_context_h ucp_context, ucp_worker_h ucp_worker,
 {
     ucx_server_ctx_t context;
     ucp_worker_h     ucp_data_worker;
+    ucp_am_handler_param_t param;
     ucp_ep_h         server_ep;
     ucs_status_t     status;
     int              ret;
@@ -659,6 +794,22 @@ static int run_server(ucp_context_h ucp_context, ucp_worker_h ucp_worker,
     ret = init_worker(ucp_context, &ucp_data_worker);
     if (ret != 0) {
         goto err;
+    }
+
+    if (send_recv_type == CLIENT_SERVER_SEND_RECV_AM) {
+        /* Initialize Active Message data handler */
+        param.field_mask = UCP_AM_HANDLER_PARAM_FIELD_ID |
+                           UCP_AM_HANDLER_PARAM_FIELD_CB |
+                           UCP_AM_HANDLER_PARAM_FIELD_ARG;
+        param.id         = TEST_AM_ID;
+        param.cb         = ucp_am_data_cb;
+        param.arg        = ucp_data_worker; /* not used in our callback */
+        status           = ucp_worker_set_am_recv_handler(ucp_data_worker,
+                                                          &param);
+        if (status != UCS_OK) {
+            ret = -1;
+            goto err_worker;
+        }
     }
 
     /* Initialize the server's context. */
@@ -748,7 +899,8 @@ out:
 /**
  * Initialize the UCP context and worker.
  */
-static int init_context(ucp_context_h *ucp_context, ucp_worker_h *ucp_worker)
+static int init_context(ucp_context_h *ucp_context, ucp_worker_h *ucp_worker,
+                        send_recv_type_t send_recv_type)
 {
     /* UCP objects */
     ucp_params_t ucp_params;
@@ -758,12 +910,15 @@ static int init_context(ucp_context_h *ucp_context, ucp_worker_h *ucp_worker)
     memset(&ucp_params, 0, sizeof(ucp_params));
 
     /* UCP initialization */
-    ucp_params.field_mask   = UCP_PARAM_FIELD_FEATURES     |
-                              UCP_PARAM_FIELD_REQUEST_SIZE |
-                              UCP_PARAM_FIELD_REQUEST_INIT;
-    ucp_params.features     = UCP_FEATURE_STREAM | UCP_FEATURE_TAG;
-    ucp_params.request_size = sizeof(test_req_t);
-    ucp_params.request_init = request_init;
+    ucp_params.field_mask = UCP_PARAM_FIELD_FEATURES;
+
+    if (send_recv_type == CLIENT_SERVER_SEND_RECV_STREAM) {
+        ucp_params.features = UCP_FEATURE_STREAM;
+    } else if (send_recv_type == CLIENT_SERVER_SEND_RECV_TAG) {
+        ucp_params.features = UCP_FEATURE_TAG;
+    } else {
+        ucp_params.features = UCP_FEATURE_AM;
+    }
 
     status = ucp_init(&ucp_params, NULL, ucp_context);
     if (status != UCS_OK) {
@@ -803,7 +958,7 @@ int main(int argc, char **argv)
     }
 
     /* Initialize the UCX required objects */
-    ret = init_context(&ucp_context, &ucp_worker);
+    ret = init_context(&ucp_context, &ucp_worker, send_recv_type);
     if (ret != 0) {
         goto err;
     }

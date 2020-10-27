@@ -16,12 +16,18 @@ libucs_ladir       = $(includedir)/ucs
 libucs_la_LIBADD   = $(LIBM) $(top_builddir)/src/ucm/libucm.la
 
 nobase_dist_libucs_la_HEADERS = \
+	arch/aarch64/bitops.h \
+	arch/ppc64/bitops.h \
+	arch/x86_64/bitops.h \
+	arch/bitops.h \
 	algorithm/crc.h \
 	algorithm/qsort_r.h \
 	async/async_fwd.h \
 	config/global_opts.h \
 	config/parser.h \
 	config/types.h \
+	datastruct/array.h \
+	datastruct/array.inl \
 	datastruct/callbackq.h \
 	datastruct/hlist.h \
 	datastruct/khash.h \
@@ -57,23 +63,19 @@ nobase_dist_libucs_la_HEADERS = \
 	type/status.h \
 	type/thread_mode.h \
 	type/cpu_set.h \
+	arch/atomic.h \
 	arch/x86_64/global_opts.h \
+	arch/x86_64/atomic.h \
 	arch/aarch64/global_opts.h \
+	arch/generic/atomic.h \
 	arch/ppc64/global_opts.h \
 	arch/global_opts.h
 
 noinst_HEADERS = \
-	arch/aarch64/bitops.h \
 	arch/aarch64/cpu.h \
-	arch/generic/atomic.h \
 	arch/generic/cpu.h \
-	arch/ppc64/bitops.h \
 	arch/ppc64/cpu.h \
-	arch/x86_64/atomic.h \
-	arch/x86_64/bitops.h \
 	arch/x86_64/cpu.h \
-	arch/atomic.h \
-	arch/bitops.h \
 	arch/cpu.h \
 	datastruct/arbiter.h \
 	datastruct/frag_list.h \
@@ -83,6 +85,9 @@ noinst_HEADERS = \
 	datastruct/queue.h \
 	datastruct/sglib.h \
 	datastruct/sglib_wrapper.h \
+	datastruct/conn_match.h \
+	datastruct/ptr_map.h \
+	datastruct/ptr_map.inl \
 	debug/assert.h \
 	debug/debug.h \
 	debug/log.h \
@@ -124,6 +129,7 @@ libucs_la_SOURCES = \
 	config/ucm_opts.c \
 	config/parser.c \
 	datastruct/arbiter.c \
+	datastruct/array.c \
 	datastruct/callbackq.c \
 	datastruct/frag_list.c \
 	datastruct/mpmc.c \
@@ -133,6 +139,7 @@ libucs_la_SOURCES = \
 	datastruct/strided_alloc.c \
 	datastruct/string_buffer.c \
 	datastruct/string_set.c \
+	datastruct/conn_match.c \
 	debug/assert.c \
 	debug/debug.c \
 	debug/log.c \
@@ -158,7 +165,8 @@ libucs_la_SOURCES = \
 	time/timerq.c \
 	type/class.c \
 	type/status.c \
-	type/init_once.c
+	type/init_once.c \
+	type/spinlock.c
 
 if HAVE_AARCH64_THUNDERX2
 libucs_la_SOURCES += \

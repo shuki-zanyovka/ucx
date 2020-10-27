@@ -13,8 +13,7 @@ extern "C" {
 #include <ucs/sys/compiler.h>
 }
 
-class log_test : public ucs::test {
-
+class log_test : private ucs::clear_dontcopy_regions, public ucs::test {
 public:
     virtual void init() {
         /* skip because logger does not support file
@@ -129,14 +128,10 @@ public:
             int ret = system(cmd_str.c_str());
             if (ret == 0) {
                 return true;
+            } else if (ret == -1) {
+                system_ret_str = ucs::to_string(errno);
             } else {
-                system_ret_str = "return value: ";
-                if (ret == -1) {
-                    system_ret_str += ucs::to_string(ret) +
-                                      ", errno: " + ucs::to_string(errno);
-                } else {
-                    system_ret_str += ucs::to_string(WEXITSTATUS(ret));
-                }
+                system_ret_str = ucs::exit_status_info(ret);
             }
 
             ucs_log_flush();
@@ -229,9 +224,11 @@ protected:
 
         ASSERT_TRUE(len != 0);
 
+        s.resize(len);
+
         for (size_t i = 0; i < len; ++i) {
-            s += possible_vals[ucs::rand() %
-                               (ucs_array_size(possible_vals) - 1)];
+            s[i] = possible_vals[ucs::rand() %
+                                 (ucs_static_array_size(possible_vals) - 1)];
         }
     }
 

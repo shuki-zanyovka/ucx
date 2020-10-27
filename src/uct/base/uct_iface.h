@@ -502,7 +502,7 @@ typedef struct {
         _req = ucs_container_of(_priv, uct_pending_req_t, priv); \
         ucs_queue_pull_non_empty(_queue); \
         _status = _req->func(_req); \
-        if (_status != UCS_OK) { \
+        if ((_status == UCS_ERR_NO_RESOURCE) || (_status == UCS_INPROGRESS)) { \
             ucs_queue_push_head(_queue, &_base_priv->queue_elem); \
         } \
     }
@@ -551,6 +551,21 @@ typedef struct {
     }
 
 
+/**
+ * Helper macro to invoke the function from iface operations.
+ *
+ * @param _iface    UCT interface.
+ * @param _ops_type Type of iface operations.
+ * @param _func     Function to call.
+ * @param ...       Parameters that is passed to the function.
+ */
+#define uct_iface_invoke_ops_func(_iface, _ops_type, _func, ...) \
+    ({ \
+        _ops_type *__ops = ucs_derived_of((_iface)->ops, _ops_type); \
+        __ops->_func(__VA_ARGS__); \
+    })
+
+
 extern ucs_config_field_t uct_iface_config_table[];
 
 
@@ -581,6 +596,10 @@ void uct_iface_dump_am(uct_base_iface_t *iface, uct_am_trace_type_t type,
                        char *buffer, size_t max);
 
 void uct_iface_mpool_empty_warn(uct_base_iface_t *iface, ucs_mpool_t *mp);
+
+void uct_iface_set_async_event_params(const uct_iface_params_t *params,
+                                      uct_async_event_cb_t *event_cb,
+                                      void **event_arg);
 
 ucs_status_t uct_set_ep_failed(ucs_class_t* cls, uct_ep_h tl_ep, uct_iface_h
                                tl_iface, ucs_status_t status);
@@ -643,15 +662,17 @@ uct_iface_invoke_am(uct_base_iface_t *iface, uint8_t id, void *data,
  * Invoke send completion.
  *
  * @param comp   Completion to invoke.
- * @param data   Optional completion data (operation reply).
+ * @param status Status of completed operation.
  */
 static UCS_F_ALWAYS_INLINE
 void uct_invoke_completion(uct_completion_t *comp, ucs_status_t status)
 {
     ucs_trace_func("comp=%p, count=%d, status=%d", comp, comp->count, status);
     ucs_assertv(comp->count > 0, "comp=%p count=%d", comp, comp->count);
+
+    uct_completion_update_status(comp, status);
     if (--comp->count == 0) {
-        comp->func(comp, status);
+        comp->func(comp);
     }
 }
 

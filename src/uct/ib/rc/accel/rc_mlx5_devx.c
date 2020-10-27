@@ -45,7 +45,9 @@ ucs_status_t uct_rc_mlx5_devx_iface_subscribe_event(uct_rc_mlx5_iface_common_t *
 }
 
 #if HAVE_DECL_MLX5DV_DEVX_SUBSCRIBE_DEVX_EVENT
-static void uct_rc_mlx5_devx_iface_event_handler(int fd, int events, void *arg)
+static void
+uct_rc_mlx5_devx_iface_event_handler(int fd, ucs_event_set_types_t events,
+                                     void *arg)
 {
     uct_rc_mlx5_iface_common_t *iface = arg;
     uct_ib_md_t *md                   = uct_ib_iface_md(&iface->super.super);
@@ -55,11 +57,14 @@ static void uct_rc_mlx5_devx_iface_event_handler(int fd, int events, void *arg)
 
     ret = mlx5dv_devx_get_event(iface->event_channel, &devx_event, sizeof(devx_event));
     if (ret < 0) {
-        ucs_warn("mlx5dv_devx_get_event() failed: %m");
+        if (errno != EAGAIN) {
+            ucs_warn("mlx5dv_devx_get_event() failed: %m");
+        }
         return;
     }
 
-    event.event_type = devx_event.cookie & UCT_IB_MLX5_DEVX_EVENT_TYPE_MASK;
+    event.event_type = (enum ibv_event_type)(devx_event.cookie &
+                                             UCT_IB_MLX5_DEVX_EVENT_TYPE_MASK);
     switch (event.event_type) {
     case IBV_EVENT_QP_LAST_WQE_REACHED:
         event.qp_num = devx_event.cookie >> UCT_IB_MLX5_DEVX_EVENT_DATA_SHIFT;
@@ -140,24 +145,18 @@ uct_rc_mlx5_devx_init_rx_common(uct_rc_mlx5_iface_common_t *iface,
                                 const struct mlx5dv_pd *dvpd, void *wq)
 {
     ucs_status_t status  = UCS_ERR_NO_MEMORY;
-    uct_ib_device_t *dev = &md->super.dev;
-    int len, ret, max, stride, log_num_of_strides, wq_type;
+    int len, max, stride, log_num_of_strides, wq_type;
 
     stride = uct_ib_mlx5_srq_stride(iface->tm.mp.num_strides);
     max    = uct_ib_mlx5_srq_max_wrs(config->super.rx.queue_len,
                                      iface->tm.mp.num_strides);
     max    = ucs_roundup_pow2(max);
     len    = max * stride;
-    ret    = posix_memalign(&iface->rx.srq.buf, ucs_get_page_size(), len);
-    if (ret) {
-        return status;
-    }
 
-    iface->rx.srq.devx.mem = mlx5dv_devx_umem_reg(dev->ibv_context,
-                                                  iface->rx.srq.buf, len,
-                                                  IBV_ACCESS_LOCAL_WRITE);
-    if (!iface->rx.srq.devx.mem) {
-        goto err_free_buf;
+    status = uct_ib_mlx5_md_buf_alloc(md, len, 0, &iface->rx.srq.buf,
+                                      &iface->rx.srq.devx.mem, "srq buf");
+    if (status != UCS_OK) {
+        return status;
     }
 
     iface->rx.srq.devx.dbrec = uct_ib_mlx5_get_dbrec(md);
@@ -183,7 +182,7 @@ uct_rc_mlx5_devx_init_rx_common(uct_rc_mlx5_iface_common_t *iface,
     UCT_IB_MLX5DV_SET  (wq, wq, pd,            dvpd->pdn);
     UCT_IB_MLX5DV_SET  (wq, wq, dbr_umem_id,   iface->rx.srq.devx.dbrec->mem_id);
     UCT_IB_MLX5DV_SET64(wq, wq, dbr_addr,      iface->rx.srq.devx.dbrec->offset);
-    UCT_IB_MLX5DV_SET  (wq, wq, wq_umem_id,    iface->rx.srq.devx.mem->umem_id);
+    UCT_IB_MLX5DV_SET  (wq, wq, wq_umem_id,    iface->rx.srq.devx.mem.mem->umem_id);
 
     if (UCT_RC_MLX5_MP_ENABLED(iface)) {
         /* Normalize to device's interface values (range of (-6) - 7) */
@@ -196,7 +195,7 @@ uct_rc_mlx5_devx_init_rx_common(uct_rc_mlx5_iface_common_t *iface,
                           (ucs_ilog2(iface->super.super.config.seg_size) - 6));
     }
 
-    iface->rx.srq.type = UCT_IB_MLX5_OBJ_TYPE_DEVX;    
+    iface->rx.srq.type = UCT_IB_MLX5_OBJ_TYPE_DEVX;
     uct_ib_mlx5_srq_buff_init(&iface->rx.srq, 0, max - 1,
                               iface->super.super.config.seg_size,
                               iface->tm.mp.num_strides);
@@ -205,9 +204,7 @@ uct_rc_mlx5_devx_init_rx_common(uct_rc_mlx5_iface_common_t *iface,
     return UCS_OK;
 
 err_free_mem:
-    mlx5dv_devx_umem_dereg(iface->rx.srq.devx.mem);
-err_free_buf:
-    ucs_free(iface->rx.srq.buf);
+    uct_ib_mlx5_md_buf_free(md, iface->rx.srq.buf, &iface->rx.srq.devx.mem);
     return status;
 }
 
@@ -267,7 +264,7 @@ uct_rc_mlx5_devx_init_rx_tm(uct_rc_mlx5_iface_common_t *iface,
     return UCS_OK;
 
 err_cleanup_srq:
-    uct_rc_mlx5_devx_cleanup_srq(&iface->rx.srq);
+    uct_rc_mlx5_devx_cleanup_srq(md, &iface->rx.srq);
     return status;
 }
 
@@ -314,15 +311,14 @@ ucs_status_t uct_rc_mlx5_devx_init_rx(uct_rc_mlx5_iface_common_t *iface,
     return UCS_OK;
 
 err_cleanup_srq:
-    uct_rc_mlx5_devx_cleanup_srq(&iface->rx.srq);
+    uct_rc_mlx5_devx_cleanup_srq(md, &iface->rx.srq);
     return status;
 }
 
-void uct_rc_mlx5_devx_cleanup_srq(uct_ib_mlx5_srq_t *srq)
+void uct_rc_mlx5_devx_cleanup_srq(uct_ib_mlx5_md_t *md, uct_ib_mlx5_srq_t *srq)
 {
     uct_ib_mlx5_put_dbrec(srq->devx.dbrec);
-    mlx5dv_devx_umem_dereg(srq->devx.mem);
-    ucs_free(srq->buf);
+    uct_ib_mlx5_md_buf_free(md, srq->buf, &srq->devx.mem);
 }
 
 ucs_status_t
@@ -367,12 +363,12 @@ uct_rc_mlx5_iface_common_devx_connect_qp(uct_rc_mlx5_iface_common_t *iface,
                           mlx5_av.hop_limit);
         UCT_IB_MLX5DV_SET(qpc, qpc, primary_address_path.src_addr_index,
                           ah_attr->grh.sgid_index);
-        ucs_assert(ah_attr->dlid >= UCT_IB_ROCE_UDP_SRC_PORT_BASE);
-        UCT_IB_MLX5DV_SET(qpc, qpc, primary_address_path.udp_sport,
-                          ah_attr->dlid);
         UCT_IB_MLX5DV_SET(qpc, qpc, primary_address_path.eth_prio,
                           iface->super.super.config.sl);
         if (uct_ib_iface_is_roce_v2(&iface->super.super, dev)) {
+            ucs_assert(ah_attr->dlid >= UCT_IB_ROCE_UDP_SRC_PORT_BASE);
+            UCT_IB_MLX5DV_SET(qpc, qpc, primary_address_path.udp_sport,
+                              ah_attr->dlid);
             UCT_IB_MLX5DV_SET(qpc, qpc, primary_address_path.dscp,
                               iface->super.super.config.traffic_class >> 2);
         }

@@ -10,21 +10,15 @@
 
 #include "tag_match.inl"
 #include "eager.h"
-#include "rndv.h"
+#include "tag_rndv.h"
 
 #include <ucp/core/ucp_ep.h>
 #include <ucp/core/ucp_worker.h>
 #include <ucp/core/ucp_context.h>
 #include <ucp/proto/proto_am.inl>
+#include <ucp/proto/proto_common.inl>
 #include <ucs/datastruct/mpool.inl>
 #include <string.h>
-
-
-#define UCP_TAG_SEND_CHECK_STATUS(_status, _ret, _done) \
-    if (ucs_likely((_status) != UCS_ERR_NO_RESOURCE)) { \
-        _ret = UCS_STATUS_PTR(_status); /* UCS_OK also goes here */ \
-        _done; \
-    }
 
 
 static UCS_F_ALWAYS_INLINE size_t
@@ -46,7 +40,7 @@ ucp_tag_get_rndv_threshold(const ucp_request_t *req, size_t count,
     case UCP_DATATYPE_GENERIC:
         return rndv_am_thresh;
     default:
-        ucs_error("Invalid data type %lx", req->send.datatype);
+        ucs_error("Invalid data type 0x%"PRIx64, req->send.datatype);
     }
 
     return SIZE_MAX;
@@ -58,21 +52,17 @@ ucp_tag_send_req(ucp_request_t *req, size_t dt_count,
                  const ucp_request_param_t *param,
                  const ucp_request_send_proto_t *proto)
 {
-    ssize_t max_short = ucp_proto_get_short_max(req, msg_config);
+    ssize_t max_short          = ucp_proto_get_short_max(req, msg_config);
+    ucp_ep_config_t *ep_config = ucp_ep_config(req->send.ep);
     ucs_status_t status;
     size_t zcopy_thresh;
     size_t rndv_thresh;
     size_t rndv_rma_thresh;
     size_t rndv_am_thresh;
 
-    if ((param->op_attr_mask & UCP_OP_ATTR_FLAG_FAST_CMPL) &&
-        ucs_likely(UCP_MEM_IS_ACCESSIBLE_FROM_CPU(req->send.mem_type))) {
-        rndv_rma_thresh = ucp_ep_config(req->send.ep)->tag.rndv_send_nbr.rma_thresh;
-        rndv_am_thresh  = ucp_ep_config(req->send.ep)->tag.rndv_send_nbr.am_thresh;
-    } else {
-        rndv_rma_thresh = ucp_ep_config(req->send.ep)->tag.rndv.rma_thresh;
-        rndv_am_thresh  = ucp_ep_config(req->send.ep)->tag.rndv.am_thresh;
-    }
+    ucp_request_param_rndv_thresh(req, param, &ep_config->tag.rndv.rma_thresh,
+                                  &ep_config->tag.rndv.am_thresh,
+                                  &rndv_rma_thresh, &rndv_am_thresh);
 
     rndv_thresh = ucp_tag_get_rndv_threshold(req, dt_count, msg_config->max_iov,
                                              rndv_rma_thresh, rndv_am_thresh);
@@ -85,15 +75,16 @@ ucp_tag_send_req(ucp_request_t *req, size_t dt_count,
         zcopy_thresh = rndv_thresh;
     }
 
-    ucs_trace_req("select tag request(%p) progress algorithm datatype=%lx "
-                  "buffer=%p length=%zu max_short=%zd rndv_thresh=%zu "
+    ucs_trace_req("select tag request(%p) progress algorithm datatype=0x%"PRIx64
+                  " buffer=%p length=%zu max_short=%zd rndv_thresh=%zu "
                   "zcopy_thresh=%zu zcopy_enabled=%d",
                   req, req->send.datatype, req->send.buffer, req->send.length,
                   max_short, rndv_thresh, zcopy_thresh,
                   !(param->op_attr_mask & UCP_OP_ATTR_FLAG_FAST_CMPL));
 
     status = ucp_request_send_start(req, max_short, zcopy_thresh, rndv_thresh,
-                                    dt_count, msg_config, proto);
+                                    dt_count, 0, req->send.length, msg_config,
+                                    proto);
     if (ucs_unlikely(status != UCS_OK)) {
         if (status == UCS_ERR_NO_PROGRESS) {
             /* RMA/AM rendezvous */
@@ -121,20 +112,20 @@ ucp_tag_send_req(ucp_request_t *req, size_t dt_count,
      * release the request and return the status.
      * Otherwise, return the request.
      */
-    status = ucp_request_send(req, 0);
+    ucp_request_send(req, 0);
     if (req->flags & UCP_REQUEST_FLAG_COMPLETED) {
-        ucp_request_imm_cmpl_param(param, req, status, send);
+        ucp_request_imm_cmpl_param(param, req, send);
     }
 
-    ucp_request_set_send_callback_param(param, req);
+    ucp_request_set_send_callback_param(param, req, send);
     ucs_trace_req("returning send request %p", req);
     return req + 1;
 }
 
 static UCS_F_ALWAYS_INLINE void
 ucp_tag_send_req_init(ucp_request_t* req, ucp_ep_h ep, const void* buffer,
-                      uintptr_t datatype, size_t count, ucp_tag_t tag,
-                      uint32_t flags)
+                      uintptr_t datatype, ucs_memory_type_t memory_type,
+                      size_t count, ucp_tag_t tag, uint32_t flags)
 {
     req->flags                  = flags | UCP_REQUEST_FLAG_SEND_TAG;
     req->send.ep                = ep;
@@ -145,9 +136,8 @@ ucp_tag_send_req_init(ucp_request_t* req, ucp_ep_h ep, const void* buffer,
     req->send.length       = ucp_dt_length(req->send.datatype, count,
                                            req->send.buffer,
                                            &req->send.state.dt);
-    req->send.mem_type     = ucp_memory_type_detect(ep->worker->context,
-                                                    (void*)buffer,
-                                                    req->send.length);
+    req->send.mem_type     = ucp_get_memory_type(ep->worker->context, (void*)buffer,
+                                                 req->send.length, memory_type);
     req->send.lane         = ucp_ep_config(ep)->tag.lane;
     req->send.pending_lane = UCP_NULL_LANE;
 }
@@ -191,7 +181,7 @@ ucp_tag_send_inline(ucp_ep_h ep, const void *buffer, size_t length, ucp_tag_t ta
 UCS_PROFILE_FUNC(ucs_status_ptr_t, ucp_tag_send_nb,
                  (ep, buffer, count, datatype, tag, cb),
                  ucp_ep_h ep, const void *buffer, size_t count,
-                 uintptr_t datatype, ucp_tag_t tag, ucp_send_callback_t cb)
+                 ucp_datatype_t datatype, ucp_tag_t tag, ucp_send_callback_t cb)
 {
     ucp_request_param_t param = {
         .op_attr_mask = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_CALLBACK,
@@ -205,7 +195,7 @@ UCS_PROFILE_FUNC(ucs_status_ptr_t, ucp_tag_send_nb,
 UCS_PROFILE_FUNC(ucs_status_t, ucp_tag_send_nbr,
                  (ep, buffer, count, datatype, tag, request),
                  ucp_ep_h ep, const void *buffer, size_t count,
-                 uintptr_t datatype, ucp_tag_t tag, void *request)
+                 ucp_datatype_t datatype, ucp_tag_t tag, void *request)
 {
     ucp_request_param_t param = {
         .op_attr_mask = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_REQUEST |
@@ -229,7 +219,7 @@ UCS_PROFILE_FUNC(ucs_status_t, ucp_tag_send_nbr,
 UCS_PROFILE_FUNC(ucs_status_ptr_t, ucp_tag_send_sync_nb,
                  (ep, buffer, count, datatype, tag, cb),
                  ucp_ep_h ep, const void *buffer, size_t count,
-                 uintptr_t datatype, ucp_tag_t tag, ucp_send_callback_t cb)
+                 ucp_datatype_t datatype, ucp_tag_t tag, ucp_send_callback_t cb)
 {
     ucp_request_param_t param = {
         .op_attr_mask = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_CALLBACK,
@@ -245,11 +235,14 @@ UCS_PROFILE_FUNC(ucs_status_ptr_t, ucp_tag_send_nbx,
                  ucp_ep_h ep, const void *buffer, size_t count,
                  ucp_tag_t tag, const ucp_request_param_t *param)
 {
+    size_t contig_length = 0;
     ucs_status_t status;
     ucp_request_t *req;
     ucs_status_ptr_t ret;
     uintptr_t datatype;
+    ucs_memory_type_t memory_type;
     uint32_t attr_mask;
+    ucp_worker_h worker;
 
     UCP_CONTEXT_CHECK_FEATURE_FLAGS(ep->worker->context, UCP_FEATURE_TAG,
                                     return UCS_STATUS_PTR(UCS_ERR_INVALID_PARAM));
@@ -263,14 +256,16 @@ UCS_PROFILE_FUNC(ucs_status_ptr_t, ucp_tag_send_nbx,
 
     if (ucs_likely(attr_mask == 0)) {
         status = UCS_PROFILE_CALL(ucp_tag_send_inline, ep, buffer, count, tag);
-        UCP_TAG_SEND_CHECK_STATUS(status, ret, goto out);
-        datatype = ucp_dt_make_contig(1);
+        ucp_request_send_check_status(status, ret, goto out);
+        datatype      = ucp_dt_make_contig(1);
+        contig_length = count;
     } else if (attr_mask == UCP_OP_ATTR_FIELD_DATATYPE) {
         datatype = param->datatype;
         if (ucs_likely(UCP_DT_IS_CONTIG(datatype))) {
-            status = UCS_PROFILE_CALL(ucp_tag_send_inline, ep, buffer,
-                                      ucp_contig_dt_length(datatype, count), tag);
-            UCP_TAG_SEND_CHECK_STATUS(status, ret, goto out);
+            contig_length = ucp_contig_dt_length(datatype, count);
+            status        = UCS_PROFILE_CALL(ucp_tag_send_inline, ep, buffer,
+                                             contig_length, tag);
+            ucp_request_send_check_status(status, ret, goto out);
         }
     } else {
         datatype = ucp_dt_make_contig(1);
@@ -281,13 +276,25 @@ UCS_PROFILE_FUNC(ucs_status_ptr_t, ucp_tag_send_nbx,
         goto out;
     }
 
-    req = ucp_request_get_param(ep->worker, param,
-                                {ret = UCS_STATUS_PTR(UCS_ERR_NO_MEMORY);
-                                 goto out;});
+    worker      = ep->worker;
+    memory_type = ucp_request_param_mem_type(param);
+    req         = ucp_request_get_param(worker, param,
+                                        {ret = UCS_STATUS_PTR(UCS_ERR_NO_MEMORY);
+                                        goto out;});
 
-    ucp_tag_send_req_init(req, ep, buffer, datatype, count, tag, 0);
-    ret = ucp_tag_send_req(req, count, &ucp_ep_config(ep)->tag.eager,
-                           param, ucp_ep_config(ep)->tag.proto);
+    if (worker->context->config.ext.proto_enable) {
+        req->send.msg_proto.tag.tag = tag;
+
+        ret = ucp_proto_request_send_op(ep, &ucp_ep_config(ep)->proto_select,
+                                        UCP_WORKER_CFG_INDEX_NULL, req,
+                                        UCP_OP_ID_TAG_SEND, buffer, count,
+                                        datatype, contig_length, param);
+    } else {
+        ucp_tag_send_req_init(req, ep, buffer, datatype, memory_type, count,
+                              tag, 0);
+        ret = ucp_tag_send_req(req, count, &ucp_ep_config(ep)->tag.eager,
+                               param, ucp_ep_config(ep)->tag.proto);
+    }
 out:
     UCP_WORKER_THREAD_CS_EXIT_CONDITIONAL(ep->worker);
     return ret;
@@ -302,6 +309,7 @@ UCS_PROFILE_FUNC(ucs_status_ptr_t, ucp_tag_send_sync_nbx,
     ucp_request_t *req;
     ucs_status_ptr_t ret;
     uintptr_t datatype;
+    ucs_memory_type_t memory_type;
 
     UCP_CONTEXT_CHECK_FEATURE_FLAGS(ep->worker->context, UCP_FEATURE_TAG,
                                     return UCS_STATUS_PTR(UCS_ERR_INVALID_PARAM));
@@ -310,15 +318,15 @@ UCS_PROFILE_FUNC(ucs_status_ptr_t, ucp_tag_send_sync_nbx,
     ucs_trace_req("send_sync_nbx buffer %p count %zu tag %"PRIx64" to %s",
                   buffer, count, tag, ucp_ep_peer_name(ep));
 
-    datatype = (param->op_attr_mask & UCP_OP_ATTR_FIELD_DATATYPE) ?
-               param->datatype : ucp_dt_make_contig(1);
+    datatype    = ucp_request_param_datatype(param);
+    memory_type = ucp_request_param_mem_type(param);
 
     if (!ucp_ep_config_test_rndv_support(ucp_ep_config(ep))) {
         ret = UCS_STATUS_PTR(UCS_ERR_UNSUPPORTED);
         goto out;
     }
 
-    status = ucp_ep_resolve_dest_ep_ptr(ep, ucp_ep_config(ep)->tag.lane);
+    status = ucp_ep_resolve_remote_id(ep, ucp_ep_config(ep)->tag.lane);
     if (status != UCS_OK) {
         ret = UCS_STATUS_PTR(status);
         goto out;
@@ -328,7 +336,7 @@ UCS_PROFILE_FUNC(ucs_status_ptr_t, ucp_tag_send_sync_nbx,
                                 {ret = UCS_STATUS_PTR(UCS_ERR_NO_MEMORY);
                                  goto out;});
 
-    ucp_tag_send_req_init(req, ep, buffer, datatype, count, tag,
+    ucp_tag_send_req_init(req, ep, buffer, datatype, memory_type, count, tag,
                           UCP_REQUEST_FLAG_SYNC);
     ret = ucp_tag_send_req(req, count, &ucp_ep_config(ep)->tag.eager,
                            param, ucp_ep_config(ep)->tag.sync_proto);

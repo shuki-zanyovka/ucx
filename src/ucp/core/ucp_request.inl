@@ -11,10 +11,12 @@
 #include "ucp_worker.h"
 #include "ucp_ep.inl"
 
+
 #include <ucp/core/ucp_worker.h>
 #include <ucp/dt/dt.h>
 #include <ucs/profile/profile.h>
 #include <ucs/datastruct/mpool.inl>
+#include <ucs/datastruct/ptr_map.inl>
 #include <ucp/dt/dt.inl>
 #include <inttypes.h>
 
@@ -28,7 +30,8 @@
     (((_flags) & UCP_REQUEST_FLAG_EXPECTED)        ? 'e' : '-'), \
     (((_flags) & UCP_REQUEST_FLAG_LOCAL_COMPLETED) ? 'L' : '-'), \
     (((_flags) & UCP_REQUEST_FLAG_CALLBACK)        ? 'c' : '-'), \
-    (((_flags) & UCP_REQUEST_FLAG_RECV)            ? 'r' : '-'), \
+    (((_flags) & (UCP_REQUEST_FLAG_RECV_TAG | \
+                  UCP_REQUEST_FLAG_RECV_AM))       ? 'r' : '-'), \
     (((_flags) & UCP_REQUEST_FLAG_SYNC)            ? 's' : '-')
 
 #define UCP_RECV_DESC_FMT \
@@ -104,20 +107,43 @@
 
 #define ucp_request_cb_param(_param, _req, _cb, ...) \
     if ((_param)->op_attr_mask & UCP_OP_ATTR_FIELD_CALLBACK) { \
-        param->cb._cb(req + 1, status, ##__VA_ARGS__, param->user_data); \
+        param->cb._cb(req + 1, (_req)->status, ##__VA_ARGS__, param->user_data); \
     }
 
 
-#define ucp_request_imm_cmpl_param(_param, _req, _status, _cb, ...) \
+#define ucp_request_imm_cmpl_param(_param, _req, _cb, ...) \
     if ((_param)->op_attr_mask & UCP_OP_ATTR_FLAG_NO_IMM_CMPL) { \
         ucp_request_cb_param(_param, _req, _cb, ##__VA_ARGS__); \
         ucs_trace_req("request %p completed, but immediate completion is " \
                       "prohibited, status %s", _req, \
-                      ucs_status_string(_status)); \
+                      ucs_status_string((_req)->status)); \
         return (_req) + 1; \
     } \
-    ucp_request_put_param(_param, _req); \
-    return UCS_STATUS_PTR(_status);
+    { \
+        ucs_status_t _status = (_req)->status; \
+        ucp_request_put_param(_param, _req); \
+        return UCS_STATUS_PTR(_status); \
+    }
+
+
+#define ucp_request_set_callback_param(_param, _param_cb, _req, _req_cb) \
+    if ((_param)->op_attr_mask & UCP_OP_ATTR_FIELD_CALLBACK) { \
+        ucp_request_set_callback(_req, _req_cb.cb, (_param)->cb._param_cb, \
+                                 ((_param)->op_attr_mask & \
+                                  UCP_OP_ATTR_FIELD_USER_DATA) ? \
+                                 (_param)->user_data : NULL); \
+    }
+
+
+#define ucp_request_set_send_callback_param(_param, _req, _cb) \
+    ucp_request_set_callback_param(_param, send, _req, _cb)
+
+
+#define ucp_request_send_check_status(_status, _ret, _done) \
+    if (ucs_likely((_status) != UCS_ERR_NO_RESOURCE)) { \
+        _ret = UCS_STATUS_PTR(_status); /* UCS_OK also goes here */ \
+        _done; \
+    }
 
 
 static UCS_F_ALWAYS_INLINE void
@@ -142,7 +168,7 @@ static UCS_F_ALWAYS_INLINE void
 ucp_request_complete_tag_recv(ucp_request_t *req, ucs_status_t status)
 {
     ucs_trace_req("completing receive request %p (%p) "UCP_REQUEST_FLAGS_FMT
-                  " stag 0x%"PRIx64" len %zu, %s",
+                  " stag 0x%" PRIx64" len %zu, %s",
                   req, req + 1, UCP_REQUEST_FLAGS_ARG(req->flags),
                   req->recv.tag.info.sender_tag, req->recv.tag.info.length,
                   ucs_status_string(status));
@@ -168,7 +194,8 @@ ucp_request_complete_stream_recv(ucp_request_t *req, ucp_ep_ext_proto_t* ep_ext,
                   req, req + 1, UCP_REQUEST_FLAGS_ARG(req->flags),
                   req->recv.stream.length, ucs_status_string(status));
     UCS_PROFILE_REQUEST_EVENT(req, "complete_recv", status);
-    ucp_request_complete(req, recv.stream.cb, status, req->recv.stream.length);
+    ucp_request_complete(req, recv.stream.cb, status, req->recv.stream.length,
+                         req->user_data);
 }
 
 static UCS_F_ALWAYS_INLINE int
@@ -203,8 +230,7 @@ ucp_request_can_complete_stream_recv(ucp_request_t *req)
  *         *req_status if filled with the completion status if completed.
  */
 static int UCS_F_ALWAYS_INLINE
-ucp_request_try_send(ucp_request_t *req, ucs_status_t *req_status,
-                     unsigned pending_flags)
+ucp_request_try_send(ucp_request_t *req, unsigned pending_flags)
 {
     ucs_status_t status;
 
@@ -212,22 +238,17 @@ ucp_request_try_send(ucp_request_t *req, ucs_status_t *req_status,
     /* coverity[address_free] */
     status = req->send.uct.func(&req->send.uct);
     if (status == UCS_OK) {
-        /* Completed the operation */
-        *req_status = UCS_OK;
+        /* Completed the operation, error also goes here */
         return 1;
     } else if (status == UCS_INPROGRESS) {
         /* Not completed, but made progress */
         return 0;
-    } else if (status != UCS_ERR_NO_RESOURCE) {
-        /* Unexpected error */
-        ucp_request_complete_send(req, status);
-        *req_status = status;
-        return 1;
+    } else if (status == UCS_ERR_NO_RESOURCE) {
+        /* No send resources, try to add to pending queue */
+        return ucp_request_pending_add(req, pending_flags);
     }
 
-    /* No send resources, try to add to pending queue */
-    ucs_assert(status == UCS_ERR_NO_RESOURCE);
-    return ucp_request_pending_add(req, req_status, pending_flags);
+    ucs_fatal("unexpected error: %s", ucs_status_string(status));
 }
 
 /**
@@ -236,17 +257,11 @@ ucp_request_try_send(ucp_request_t *req, ucs_status_t *req_status,
  * @param [in]  req             Request to start.
  * @param [in]  pending_flags   flags to be passed to UCT if request will be
  *                              added to pending queue.
- *
- * @return UCS_OK - completed (callback will not be called)
- *         UCS_INPROGRESS - started but not completed
- *         other error - failure
- */
-static UCS_F_ALWAYS_INLINE ucs_status_t
+ * */
+static UCS_F_ALWAYS_INLINE void
 ucp_request_send(ucp_request_t *req, unsigned pending_flags)
 {
-    ucs_status_t status = UCS_ERR_NOT_IMPLEMENTED;
-    while (!ucp_request_try_send(req, &status, pending_flags));
-    return status;
+    while (!ucp_request_try_send(req, pending_flags));
 }
 
 static UCS_F_ALWAYS_INLINE
@@ -254,7 +269,7 @@ void ucp_request_send_generic_dt_finish(ucp_request_t *req)
 {
     ucp_dt_generic_t *dt;
     if (UCP_DT_IS_GENERIC(req->send.datatype)) {
-        dt = ucp_dt_generic(req->send.datatype);
+        dt = ucp_dt_to_generic(req->send.datatype);
         ucs_assert(NULL != dt);
         dt->ops.finish(req->send.state.dt.dt.generic.state);
     }
@@ -265,7 +280,7 @@ void ucp_request_recv_generic_dt_finish(ucp_request_t *req)
 {
     ucp_dt_generic_t *dt;
     if (UCP_DT_IS_GENERIC(req->recv.datatype)) {
-        dt = ucp_dt_generic(req->recv.datatype);
+        dt = ucp_dt_to_generic(req->recv.datatype);
         ucs_assert(NULL != dt);
         dt->ops.finish(req->recv.state.dt.generic.state);
     }
@@ -278,8 +293,8 @@ ucp_request_send_state_init(ucp_request_t *req, ucp_datatype_t datatype,
     ucp_dt_generic_t *dt_gen;
     void             *state_gen;
 
-    VALGRIND_MAKE_MEM_UNDEFINED(&req->send.state.uct_comp.count,
-                                sizeof(req->send.state.uct_comp.count));
+    VALGRIND_MAKE_MEM_UNDEFINED(&req->send.state.uct_comp,
+                                sizeof(req->send.state.uct_comp));
     VALGRIND_MAKE_MEM_UNDEFINED(&req->send.state.dt.offset,
                                 sizeof(req->send.state.dt.offset));
 
@@ -296,7 +311,7 @@ ucp_request_send_state_init(ucp_request_t *req, ucp_datatype_t datatype,
         req->send.state.dt.dt.iov.dt_reg        = NULL;
         return;
     case UCP_DATATYPE_GENERIC:
-        dt_gen    = ucp_dt_generic(datatype);
+        dt_gen    = ucp_dt_to_generic(datatype);
         state_gen = dt_gen->ops.start_pack(dt_gen->context, req->send.buffer,
                                            dt_count);
         req->send.state.dt.dt.generic.state = state_gen;
@@ -317,14 +332,30 @@ ucp_request_send_state_reset(ucp_request_t *req,
     case UCP_REQUEST_SEND_PROTO_RNDV_GET:
     case UCP_REQUEST_SEND_PROTO_RNDV_PUT:
     case UCP_REQUEST_SEND_PROTO_ZCOPY_AM:
-        req->send.state.uct_comp.func       = comp_cb;
-        req->send.state.uct_comp.count      = 0;
+        req->send.state.uct_comp.func   = comp_cb;
+        req->send.state.uct_comp.count  = 0;
+        req->send.state.uct_comp.status = UCS_OK;
         /* Fall through */
     case UCP_REQUEST_SEND_PROTO_BCOPY_AM:
-        req->send.state.dt.offset           = 0;
+        req->send.state.dt.offset       = 0;
         break;
     default:
         ucs_fatal("unknown protocol");
+    }
+}
+
+static UCS_F_ALWAYS_INLINE void
+ucp_request_send_state_advance_comp(ucp_request_t *req, ucs_status_t status)
+{
+    ucs_assert(status != UCS_ERR_NO_RESOURCE);
+
+    if (status == UCS_INPROGRESS) {
+        ++req->send.state.uct_comp.count;
+    } else if (UCS_STATUS_IS_ERR(status)) {
+        uct_completion_update_status(&req->send.state.uct_comp, status);
+        if (req->send.state.uct_comp.count == 0) {
+            req->send.state.uct_comp.func(&req->send.state.uct_comp);
+        }
     }
 }
 
@@ -346,27 +377,16 @@ ucp_request_send_state_advance(ucp_request_t *req,
                                const ucp_dt_state_t *new_dt_state,
                                unsigned proto, ucs_status_t status)
 {
-    if (ucs_unlikely(UCS_STATUS_IS_ERR(status))) {
-        /* Don't advance after failed operation in order to continue on next try
-         * from last valid point.
-         */
+    if (status == UCS_ERR_NO_RESOURCE) {
+        /* Don't advance in order to continue
+         * on next try from last valid point. */
         return;
     }
 
     switch (proto) {
-    case UCP_REQUEST_SEND_PROTO_RMA:
-        if (status == UCS_INPROGRESS) {
-            ++req->send.state.uct_comp.count;
-        }
-        break;
     case UCP_REQUEST_SEND_PROTO_ZCOPY_AM:
-        /* Fall through */
     case UCP_REQUEST_SEND_PROTO_RNDV_GET:
     case UCP_REQUEST_SEND_PROTO_RNDV_PUT:
-        if (status == UCS_INPROGRESS) {
-            ++req->send.state.uct_comp.count;
-        }
-        /* Fall through */
     case UCP_REQUEST_SEND_PROTO_BCOPY_AM:
         ucs_assert(new_dt_state != NULL);
         if (UCP_DT_IS_CONTIG(req->send.datatype)) {
@@ -376,6 +396,19 @@ ucp_request_send_state_advance(ucp_request_t *req,
             /* cppcheck-suppress nullPointer */
             req->send.state.dt        = *new_dt_state;
         }
+
+        if (UCS_STATUS_IS_ERR(status)) {
+            /* fast-forward multi-fragment protocol */
+            req->send.state.dt.offset = req->send.length;
+        }
+
+        if (proto != UCP_REQUEST_SEND_PROTO_BCOPY_AM) {
+            ucp_request_send_state_advance_comp(req, status);
+        }
+
+        break;
+    case UCP_REQUEST_SEND_PROTO_RMA:
+        ucp_request_send_state_advance_comp(req, status);
         break;
     default:
         ucs_fatal("unknown protocol");
@@ -537,7 +570,7 @@ ucp_request_recv_data_unpack(ucp_request_t *req, const void *data,
         return UCS_OK;
 
     case UCP_DATATYPE_GENERIC:
-        dt_gen = ucp_dt_generic(req->recv.datatype);
+        dt_gen = ucp_dt_to_generic(req->recv.datatype);
         status = UCS_PROFILE_NAMED_CALL("dt_unpack", dt_gen->ops.unpack,
                                         req->recv.state.dt.generic.state,
                                         offset, data, length);
@@ -548,7 +581,7 @@ ucp_request_recv_data_unpack(ucp_request_t *req, const void *data,
         return status;
 
     default:
-        ucs_fatal("unexpected datatype=%lx", req->recv.datatype);
+        ucs_fatal("unexpected datatype=0x%" PRIx64, req->recv.datatype);
     }
 }
 
@@ -606,48 +639,153 @@ ucp_recv_desc_release(ucp_recv_desc_t *rdesc)
     }
 }
 
+static UCS_F_ALWAYS_INLINE void
+ucp_request_complete_am_recv(ucp_request_t *req, ucs_status_t status)
+{
+    ucs_trace_req("completing AM receive request %p (%p) "UCP_REQUEST_FLAGS_FMT
+                  " length %zu, %s",
+                  req, req + 1, UCP_REQUEST_FLAGS_ARG(req->flags),
+                  req->recv.length, ucs_status_string(status));
+    UCS_PROFILE_REQUEST_EVENT(req, "complete_recv", status);
+    ucp_recv_desc_release(req->recv.am.desc);
+    ucp_request_complete(req, recv.am.cb, status, req->recv.length,
+                         req->user_data);
+}
+
+static UCS_F_ALWAYS_INLINE ucs_status_t
+ucp_request_process_recv_data(ucp_request_t *req, const void *data,
+                              size_t length, size_t offset, int is_zcopy,
+                              int is_am)
+{
+    ucs_status_t status;
+    int last;
+
+    last = (req->recv.remaining == length);
+
+    /* process data only if the request is not in error state */
+    if (ucs_likely(req->status == UCS_OK)) {
+        req->status = ucp_request_recv_data_unpack(req, data, length,
+                                                   offset, last);
+    }
+    ucs_assertv(req->recv.remaining >= length,
+                "req->recv.remaining=%zu length=%zu",
+                req->recv.remaining, length);
+
+    req->recv.remaining -= length;
+
+    if (!last) {
+        return UCS_INPROGRESS;
+    }
+
+    status = req->status;
+    if (is_zcopy) {
+        ucp_request_recv_buffer_dereg(req);
+    }
+
+    if (is_am) {
+        ucp_request_complete_am_recv(req, status);
+    } else {
+        ucp_request_complete_tag_recv(req, status);
+    }
+
+    ucs_assert(status != UCS_INPROGRESS);
+
+    return status;
+}
+
 static UCS_F_ALWAYS_INLINE ucp_lane_index_t
 ucp_send_request_get_am_bw_lane(ucp_request_t *req)
 {
     ucp_lane_index_t lane;
 
     lane = ucp_ep_config(req->send.ep)->
-           key.am_bw_lanes[req->send.msg_proto.am_bw_index];
-    ucs_assertv(lane != UCP_NULL_LANE, "req->send.msg_proto.am_bw_index=%d",
-                req->send.msg_proto.am_bw_index);
+           key.am_bw_lanes[req->send.am_bw_index];
+    ucs_assertv(lane != UCP_NULL_LANE, "req->send.am_bw_index=%d",
+                req->send.am_bw_index);
     return lane;
 }
 
 static UCS_F_ALWAYS_INLINE void
 ucp_send_request_next_am_bw_lane(ucp_request_t *req)
 {
-    ucp_lane_index_t am_bw_index = ++req->send.msg_proto.am_bw_index;
+    ucp_lane_index_t am_bw_index = ++req->send.am_bw_index;
     ucp_ep_config_t *config      = ucp_ep_config(req->send.ep);
 
     if ((am_bw_index >= UCP_MAX_LANES) ||
         (config->key.am_bw_lanes[am_bw_index] == UCP_NULL_LANE)) {
-        req->send.msg_proto.am_bw_index = 0;
+        req->send.am_bw_index = 0;
     }
 }
 
-static UCS_F_ALWAYS_INLINE uintptr_t ucp_request_get_dest_ep_ptr(ucp_request_t *req)
+static UCS_F_ALWAYS_INLINE ucs_ptr_map_key_t
+ucp_send_request_get_ep_remote_id(ucp_request_t *req)
 {
-    /* This function may return 0, but in such cases the message should not be
-     * sent at all because the am_lane would point to a wireup (proxy) endpoint.
-     * So only the receiver side has an assertion that ep_ptr != 0.
+    /* This function may return UCP_WORKER_PTR_KEY_INVALID, but in such cases
+     * the message should not be sent at all because the am_lane would point to
+     * a wireup (proxy) endpoint. So only the receiver side has an assertion
+     * that remote_id != UCP_EP_ID_INVALID.
      */
-    return ucp_ep_dest_ep_ptr(req->send.ep);
+    return ucp_ep_remote_id(req->send.ep);
+}
+
+static UCS_F_ALWAYS_INLINE uint32_t
+ucp_request_param_flags(const ucp_request_param_t *param)
+{
+    return (param->op_attr_mask & UCP_OP_ATTR_FIELD_FLAGS) ?
+           param->flags : 0;
+}
+
+static UCS_F_ALWAYS_INLINE ucp_datatype_t
+ucp_request_param_datatype(const ucp_request_param_t *param)
+{
+    return (param->op_attr_mask & UCP_OP_ATTR_FIELD_DATATYPE) ?
+           param->datatype : ucp_dt_make_contig(1);
+}
+
+static UCS_F_ALWAYS_INLINE ucs_memory_type_t
+ucp_request_param_mem_type(const ucp_request_param_t *param)
+{
+    return (param->op_attr_mask & UCP_OP_ATTR_FIELD_MEMORY_TYPE) ?
+           param->memory_type : UCS_MEMORY_TYPE_UNKNOWN;
+}
+
+static UCS_F_ALWAYS_INLINE ucs_ptr_map_key_t
+ucp_send_request_get_id(ucp_request_t *req)
+{
+    return ucp_worker_get_request_id(req->send.ep->worker, req,
+                                     ucp_ep_use_indirect_id(req->send.ep));
 }
 
 static UCS_F_ALWAYS_INLINE void
-ucp_request_set_send_callback_param(const ucp_request_param_t *param,
-                                    ucp_request_t *req)
+ucp_request_param_rndv_thresh(ucp_request_t *req,
+                              const ucp_request_param_t *param,
+                              ucp_rndv_thresh_t *rma_thresh_config,
+                              ucp_rndv_thresh_t *am_thresh_config,
+                              size_t *rndv_rma_thresh, size_t *rndv_am_thresh)
 {
-    if (param->op_attr_mask & UCP_OP_ATTR_FIELD_CALLBACK) {
-        ucp_request_set_callback(req, send.cb, param->cb.send,
-                                 (param->op_attr_mask & UCP_OP_ATTR_FIELD_USER_DATA) ?
-                                 param->user_data : NULL);
+    if ((param->op_attr_mask & UCP_OP_ATTR_FLAG_FAST_CMPL) &&
+        ucs_likely(UCP_MEM_IS_ACCESSIBLE_FROM_CPU(req->send.mem_type))) {
+        *rndv_rma_thresh = rma_thresh_config->local;
+        *rndv_am_thresh  = am_thresh_config->local;
+    } else {
+        *rndv_rma_thresh = rma_thresh_config->remote;
+        *rndv_am_thresh  = am_thresh_config->remote;
     }
+}
+
+static UCS_F_ALWAYS_INLINE void
+ucp_invoke_uct_completion(uct_completion_t *comp, ucs_status_t status)
+{
+    uct_completion_update_status(comp, status);
+    if (--comp->count == 0) {
+        comp->func(comp);
+    }
+}
+
+static UCS_F_ALWAYS_INLINE void
+ucp_request_invoke_uct_completion(ucp_request_t *req, ucs_status_t status)
+{
+    ucp_invoke_uct_completion(&req->send.state.uct_comp, status);
 }
 
 #endif

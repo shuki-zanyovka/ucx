@@ -40,7 +40,7 @@ ucs_status_t uct_knem_md_query(uct_md_h uct_md, uct_md_attr_t *md_attr)
     md_attr->cap.flags            = UCT_MD_FLAG_REG |
                                     UCT_MD_FLAG_NEED_RKEY;
     md_attr->cap.reg_mem_types    = UCS_MEMORY_TYPES_CPU_ACCESSIBLE;
-    md_attr->cap.access_mem_type  = UCS_MEMORY_TYPE_HOST;
+    md_attr->cap.access_mem_types = UCS_BIT(UCS_MEMORY_TYPE_HOST);
     md_attr->cap.detect_mem_types = 0;
     md_attr->cap.max_alloc        = 0;
     md_attr->cap.max_reg          = ULONG_MAX;
@@ -123,7 +123,7 @@ static ucs_status_t uct_knem_mem_reg_internal(uct_md_h md, void *address, size_t
 
     rc = ioctl(knem_fd, KNEM_CMD_CREATE_REGION, &create);
     if (rc < 0) {
-        if (!silent) {
+        if (!silent && !(flags & UCT_MD_MEM_FLAG_HIDE_ERRORS)) {
             /* do not report error in silent mode: it called from rcache
              * internals, rcache will try to register memory again with
              * more accurate data */
@@ -359,6 +359,7 @@ uct_knem_md_open(uct_component_t *component, const char *md_name,
         rcache_params.ucm_event_priority = md_config->rcache.event_prio;
         rcache_params.context            = knem_md;
         rcache_params.ops                = &uct_knem_rcache_ops;
+        rcache_params.flags              = UCS_RCACHE_FLAG_PURGE_ON_FORK;
         status = ucs_rcache_create(&rcache_params, "knem rcache device",
                                    ucs_stats_get_root(), &knem_md->rcache);
         if (status == UCS_OK) {

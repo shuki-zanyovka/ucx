@@ -1,6 +1,6 @@
 /**
 * Copyright (C) Mellanox Technologies Ltd. 2001-2015.  ALL RIGHTS RESERVED.
-* Copyright (C) ARM Ltd. 2016-2019.  ALL RIGHTS RESERVED.
+* Copyright (C) ARM Ltd. 2016-2020.  ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
 */
@@ -33,6 +33,7 @@ BEGIN_C_DECLS
 
 #define ucs_aarch64_dmb(_op)          asm volatile ("dmb " #_op ::: "memory")
 #define ucs_aarch64_isb(_op)          asm volatile ("isb " #_op ::: "memory")
+#define ucs_aarch64_dsb(_op)          asm volatile ("dsb " #_op ::: "memory")
 
 /* The macro is used to serialize stores across Normal NC (or Device) and WB
  * memory, (see Arm Spec, B2.7.2).  Based on recent changes in Linux kernel:
@@ -159,14 +160,19 @@ static inline void ucs_arch_clear_cache(void *start, void *end)
     uintptr_t ptr;
     unsigned icache;
     unsigned dcache;
+    unsigned dic;
+    unsigned idc;
     unsigned ctr_el0;
 
     /* Get cache line size, using ctr_el0 register
      *
      * Bits    Name      Function
      * *****************************
-     * [31]    -         Reserved, res1.
-     * [30:28] -         Reserved, res0.
+     * [31]    -         Reserved, RES1.
+     * [30]    -         Reserved, RES0.
+     * [29]    DIC       Instruction cache invalidation requirements for data to instruction
+     *                   coherence.
+     * [28]    IDC       Data cache clean requirements for instruction to data coherence.
      * [27:24] CWG       Cache Write-Back granule. Log2 of the number of words of the
      *                   maximum size of memory that can be overwritten as a result of
      *                   the eviction of a cache entry that has had a memory location
@@ -195,14 +201,28 @@ static inline void ucs_arch_clear_cache(void *start, void *end)
     asm volatile ("mrs\t%0, ctr_el0":"=r" (ctr_el0));
     icache = sizeof(int) << (ctr_el0 & 0xf);
     dcache = sizeof(int) << ((ctr_el0 >> 16) & 0xf);
+    dic = (ctr_el0 >> 29) & 0x1;
+    idc = (ctr_el0 >> 28) & 0x1;
 
-    for (ptr = ucs_align_down((uintptr_t)start, dcache); ptr < (uintptr_t)end; ptr += dcache) {
-        asm volatile ("dc cvau, %0" :: "r" (ptr) : "memory");
+    /* 
+     * Check if Data cache clean to the Point of Unification is required for instruction to
+     * data coherence
+     */
+    if (idc == 0) {
+        for (ptr = ucs_align_down((uintptr_t)start, dcache); ptr < (uintptr_t)end; ptr += dcache) {
+            asm volatile ("dc cvau, %0" :: "r" (ptr) : "memory");
+        }
     }
-    ucs_aarch64_dsb(ish);
 
-    for (ptr = ucs_align_down((uintptr_t)start, icache); ptr < (uintptr_t)end; ptr += icache) {
-        asm volatile ("ic ivau, %0" :: "r" (ptr) : "memory");
+    /*
+     * Check if Instruction cache invalidation to the Point of Unification is required for
+     * data to instruction coherence.
+     */
+    if (dic == 0) {
+        ucs_aarch64_dsb(ish);
+        for (ptr = ucs_align_down((uintptr_t)start, icache); ptr < (uintptr_t)end; ptr += icache) {
+            asm volatile ("ic ivau, %0" :: "r" (ptr) : "memory");
+        }
     }
     ucs_aarch64_dsb(ish);
     ucs_aarch64_isb();

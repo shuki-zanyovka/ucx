@@ -13,7 +13,7 @@
 #include <uct/base/uct_iov.inl>
 #include <ucs/sys/sock.h>
 #include <ucs/sys/string.h>
-#include <ucs/datastruct/khash.h>
+#include <ucs/datastruct/conn_match.h>
 #include <ucs/algorithm/crc.h>
 #include <ucs/sys/event_set.h>
 #include <ucs/sys/iovec.h>
@@ -53,35 +53,46 @@
 #define UCT_TCP_CONFIG_MAX_CONN_RETRIES      "MAX_CONN_RETRIES"
 
 /* TX and RX caps */
-#define UCT_TCP_EP_CTX_CAPS                  (UCS_BIT(UCT_TCP_EP_CTX_TYPE_TX) | \
-                                              UCS_BIT(UCT_TCP_EP_CTX_TYPE_RX))
+#define UCT_TCP_EP_CTX_CAPS                  (UCT_TCP_EP_FLAG_CTX_TYPE_TX | \
+                                              UCT_TCP_EP_FLAG_CTX_TYPE_RX)
+
+/* Maximal value for connection sequnce number */
+#define UCT_TCP_CM_CONN_SN_MAX               UINT32_MAX
 
 
 /**
- * TCP context type
+ * TCP connection sequence number
  */
-typedef enum uct_tcp_ep_ctx_type {
+typedef uint32_t uct_tcp_cm_conn_sn_t;
+
+
+/**
+ * TCP EP flags
+ */
+enum {
     /* EP is connected to a peer to send data. This EP is managed
      * by a user and TCP mustn't free this EP even if connection
      * is broken. */
-    UCT_TCP_EP_CTX_TYPE_TX,
+    UCT_TCP_EP_FLAG_CTX_TYPE_TX        = UCS_BIT(0),
     /* EP is connected to a peer to receive data. If only RX is set
      * on a given EP, it is hidden from a user (i.e. the user is unable
      * to do any operation on that EP) and TCP is responsible to
      * free memory allocating for this EP. */
-    UCT_TCP_EP_CTX_TYPE_RX,
-
-    /* Additional flags that controls EP behavior: */
-    /* - Zcopy TX operation is in progress on a given EP. */
-    UCT_TCP_EP_CTX_TYPE_ZCOPY_TX,
-    /* - PUT RX operation is in progress on a given EP. */
-    UCT_TCP_EP_CTX_TYPE_PUT_RX,
-    /* - PUT TX operation is waiting for an ACK on a given EP */
-    UCT_TCP_EP_CTX_TYPE_PUT_TX_WAITING_ACK,
-    /* - PUT RX operation is waiting for resources to send an ACK
-     *   for received PUT operations on a given EP */
-    UCT_TCP_EP_CTX_TYPE_PUT_RX_SENDING_ACK
-} uct_tcp_ep_ctx_type_t;
+    UCT_TCP_EP_FLAG_CTX_TYPE_RX        = UCS_BIT(1),
+    /* Zcopy TX operation is in progress on a given EP. */
+    UCT_TCP_EP_FLAG_ZCOPY_TX           = UCS_BIT(2),
+    /* PUT RX operation is in progress on a given EP. */
+    UCT_TCP_EP_FLAG_PUT_RX             = UCS_BIT(3),
+    /* PUT TX operation is waiting for an ACK on a given EP. */
+    UCT_TCP_EP_FLAG_PUT_TX_WAITING_ACK = UCS_BIT(4),
+    /* PUT RX operation is waiting for resources to send an ACK
+     * for received PUT operations on a given EP. */
+    UCT_TCP_EP_FLAG_PUT_RX_SENDING_ACK = UCS_BIT(5),
+    /* EP is on connection matching context. */
+    UCT_TCP_EP_FLAG_ON_MATCH_CTX       = UCS_BIT(6),
+    /* EP failed and a callback for handling error is scheduled. */
+    UCT_TCP_EP_FLAG_FAILED             = UCS_BIT(7)
+};
 
 
 /**
@@ -108,13 +119,6 @@ typedef enum uct_tcp_ep_conn_state {
      * `UCT_TCP_CM_CONN_REQ`.
      * All AM operations return `UCS_ERR_NO_RESOURCE` error to a caller. */
     UCT_TCP_EP_CONN_STATE_WAITING_ACK,
-    /* EP is waiting for a connection and `UCT_TCP_CM_CONN_REQ` message from
-     * a peer after simultaneous connection resolution between them. This EP
-     * is a "winner" of the resolution, but no RX capability on this PR (i.e.
-     * no `UCT_TCP_CM_CONN_REQ` message was received from the peer). EP is moved
-     * to `UCT_TCP_EP_CONN_STATE_CONNECTED` state upon receiving this message.
-     * All AM operations return `UCS_ERR_NO_RESOURCE` error to a caller. */
-    UCT_TCP_EP_CONN_STATE_WAITING_REQ,
     /* EP is connected to a peer and they can communicate with each other. */
     UCT_TCP_EP_CONN_STATE_CONNECTED
 } uct_tcp_ep_conn_state_t;
@@ -123,33 +127,6 @@ typedef enum uct_tcp_ep_conn_state {
 typedef struct uct_tcp_ep uct_tcp_ep_t;
 
 typedef unsigned (*uct_tcp_ep_progress_t)(uct_tcp_ep_t *ep);
-
-static inline int uct_tcp_khash_sockaddr_in_equal(struct sockaddr_in sa1,
-                                                  struct sockaddr_in sa2)
-{
-    ucs_status_t status;
-    int cmp;
-
-    cmp = ucs_sockaddr_cmp((const struct sockaddr*)&sa1,
-                           (const struct sockaddr*)&sa2,
-                           &status);
-    ucs_assert(status == UCS_OK);
-    return !cmp;
-}
-
-static inline uint32_t uct_tcp_khash_sockaddr_in_hash(struct sockaddr_in sa)
-{
-    ucs_status_t UCS_V_UNUSED status;
-    size_t addr_size;
-
-    status = ucs_sockaddr_sizeof((const struct sockaddr*)&sa,
-                                 &addr_size);
-    ucs_assert(status == UCS_OK);
-    return ucs_crc32(0, (const void *)&sa, addr_size);
-}
-
-KHASH_INIT(uct_tcp_cm_eps, struct sockaddr_in, ucs_list_link_t*,
-           1, uct_tcp_khash_sockaddr_in_hash, uct_tcp_khash_sockaddr_in_equal);
 
 
 /**
@@ -172,23 +149,12 @@ typedef enum uct_tcp_cm_conn_event {
     /* Connection acknowledgment from a EP that accepts a conenction from
      * initiator of a connection request. */
     UCT_TCP_CM_CONN_ACK               = UCS_BIT(1),
-    /* Request for waiting of a connection request.
-     * The mesage is not sent separately (only along with a connection
-     * acknowledgment.) */
-    UCT_TCP_CM_CONN_WAIT_REQ          = UCS_BIT(2),
     /* Connection acknowledgment + Connection request. The mesasge is sent
      * from a EP that accepts remote conenction when it was in
      * `UCT_TCP_EP_CONN_STATE_CONNECTING` state (i.e. original
      * `UCT_TCP_CM_CONN_REQ` wasn't sent yet) and want to have RX capability
      * on a peer's EP in order to send AM data. */
     UCT_TCP_CM_CONN_ACK_WITH_REQ      = (UCT_TCP_CM_CONN_REQ |
-                                         UCT_TCP_CM_CONN_ACK),
-    /* Connection acknowledgment + Request for waiting of a connection request.
-     * The message is sent from a EP that accepts remote conenction when it was
-     * in `UCT_TCP_EP_CONN_STATE_WAITING_ACK` state (i.e. original
-     * `UCT_TCP_CM_CONN_REQ` was sent) and want to have RX capability on a
-     * peer's EP in order to send AM data. */
-    UCT_TCP_CM_CONN_ACK_WITH_WAIT_REQ = (UCT_TCP_CM_CONN_WAIT_REQ |
                                          UCT_TCP_CM_CONN_ACK)
 } uct_tcp_cm_conn_event_t;
 
@@ -199,6 +165,7 @@ typedef enum uct_tcp_cm_conn_event {
 typedef struct uct_tcp_cm_conn_req_pkt {
     uct_tcp_cm_conn_event_t       event;      /* Connection event ID */
     struct sockaddr_in            iface_addr; /* Socket address of UCT local iface */
+    uct_tcp_cm_conn_sn_t          conn_sn;    /* Connection sequence number */
 } UCS_S_PACKED uct_tcp_cm_conn_req_pkt_t;
 
 
@@ -287,18 +254,25 @@ typedef struct uct_tcp_ep_zcopy_tx {
  */
 struct uct_tcp_ep {
     uct_base_ep_t                 super;
-    uint8_t                       ctx_caps;         /* Which contexts are supported */
+    uint8_t                       flags;            /* Endpoint flags */
+    uint8_t                       conn_retries;     /* Number of connection attempts done */
+    uint8_t                       conn_state;       /* State of connection with peer */
+    ucs_event_set_types_t         events;           /* Current notifications */
     int                           fd;               /* Socket file descriptor */
-    uct_tcp_ep_conn_state_t       conn_state;       /* State of connection with peer */
-    unsigned                      conn_retries;     /* Number of connection attempts done */
-    int                           events;           /* Current notifications */
+    int                           stale_fd;         /* Old file descriptor which should be
+                                                     * closed as soon as the EP is connected
+                                                     * using the new fd */
+    uct_tcp_cm_conn_sn_t          conn_sn;          /* Connection sequence number */
     uct_tcp_ep_ctx_t              tx;               /* TX resources */
     uct_tcp_ep_ctx_t              rx;               /* RX resources */
     struct sockaddr_in            peer_addr;        /* Remote iface addr */
     ucs_queue_head_t              pending_q;        /* Pending operations */
     ucs_queue_head_t              put_comp_q;       /* Flush completions waiting for
                                                      * outstanding PUTs acknowledgment */
-    ucs_list_link_t               list;             /* List element to insert into TCP EP list */
+    union {
+        ucs_list_link_t           list;             /* List element to insert into TCP EP list */
+        ucs_conn_match_elem_t     elem;             /* Connection matching element */
+    };
 };
 
 
@@ -308,8 +282,7 @@ struct uct_tcp_ep {
 typedef struct uct_tcp_iface {
     uct_base_iface_t              super;             /* Parent class */
     int                           listen_fd;         /* Server socket */
-    khash_t(uct_tcp_cm_eps)       ep_cm_map;         /* Map of endpoints that don't
-                                                      * have one of the context cap */
+    ucs_conn_match_ctx_t          conn_match_ctx;    /* Connection matching context */
     ucs_list_link_t               ep_list;           /* List of endpoints */
     char                          if_name[IFNAMSIZ]; /* Network interface name */
     ucs_sys_event_set_t           *event_set;        /* Event set identifier */
@@ -320,6 +293,7 @@ typedef struct uct_tcp_iface {
                                                       * are in progress + how many EPs are
                                                       * waiting for PUT Zcopy operation ACKs
                                                       * (0/1 for each EP) */
+    ucs_range_spec_t              port_range;        /** Range of ports to use for bind() */
 
     struct {
         size_t                    tx_seg_size;       /* TX AM buffer size */
@@ -340,7 +314,7 @@ typedef struct uct_tcp_iface {
         int                       put_enable;        /* Enable PUT Zcopy operation support */
         int                       conn_nb;           /* Use non-blocking connect() */
         unsigned                  max_poll;          /* Number of events to poll per socket*/
-        unsigned                  max_conn_retries;  /* How many connection establishment attmepts
+        uint8_t                   max_conn_retries;  /* How many connection establishment attempts
                                                       * should be done if dropped connection was
                                                       * detected due to lack of system resources */
         unsigned                  syn_cnt;           /* Number of SYN retransmits that TCP should send
@@ -375,12 +349,14 @@ typedef struct uct_tcp_iface_config {
     unsigned                       syn_cnt;
     uct_iface_mpool_config_t       tx_mpool;
     uct_iface_mpool_config_t       rx_mpool;
+    ucs_range_spec_t               port_range;
 } uct_tcp_iface_config_t;
 
 
 extern uct_component_t uct_tcp_component;
 extern const char *uct_tcp_address_type_names[];
 extern const uct_tcp_cm_state_t uct_tcp_ep_cm_state[];
+extern const ucs_conn_match_ops_t uct_tcp_cm_conn_match_ops;
 extern const uct_tcp_ep_progress_t uct_tcp_ep_progress_rx_cb[];
 
 ucs_status_t uct_tcp_netif_caps(const char *if_name, double *latency_p,
@@ -404,8 +380,11 @@ void uct_tcp_iface_add_ep(uct_tcp_ep_t *ep);
 
 void uct_tcp_iface_remove_ep(uct_tcp_ep_t *ep);
 
-ucs_status_t uct_tcp_ep_handle_dropped_connect(uct_tcp_ep_t *ep,
-                                               ucs_status_t io_status);
+int uct_tcp_iface_is_self_addr(uct_tcp_iface_t *iface,
+                               const struct sockaddr_in *peer_addr);
+
+ucs_status_t uct_tcp_ep_handle_io_err(uct_tcp_ep_t *ep, const char *op_str,
+                                      ucs_status_t io_status);
 
 ucs_status_t uct_tcp_ep_init(uct_tcp_iface_t *iface, int fd,
                              const struct sockaddr_in *dest_addr,
@@ -418,14 +397,12 @@ const char *uct_tcp_ep_ctx_caps_str(uint8_t ep_ctx_caps, char *str_buffer);
 
 void uct_tcp_ep_change_ctx_caps(uct_tcp_ep_t *ep, uint8_t new_caps);
 
-ucs_status_t uct_tcp_ep_add_ctx_cap(uct_tcp_ep_t *ep,
-                                    uct_tcp_ep_ctx_type_t cap);
+void uct_tcp_ep_add_ctx_cap(uct_tcp_ep_t *ep, uint8_t cap);
 
-ucs_status_t uct_tcp_ep_remove_ctx_cap(uct_tcp_ep_t *ep,
-                                       uct_tcp_ep_ctx_type_t cap);
+void uct_tcp_ep_remove_ctx_cap(uct_tcp_ep_t *ep, uint8_t cap);
 
-ucs_status_t uct_tcp_ep_move_ctx_cap(uct_tcp_ep_t *from_ep, uct_tcp_ep_t *to_ep,
-                                     uct_tcp_ep_ctx_type_t ctx_cap);
+void uct_tcp_ep_move_ctx_cap(uct_tcp_ep_t *from_ep, uct_tcp_ep_t *to_ep,
+                             uint8_t ctx_cap);
 
 void uct_tcp_ep_destroy_internal(uct_ep_h tl_ep);
 
@@ -433,13 +410,14 @@ void uct_tcp_ep_destroy(uct_ep_h tl_ep);
 
 void uct_tcp_ep_set_failed(uct_tcp_ep_t *ep);
 
-unsigned uct_tcp_ep_is_self(const uct_tcp_ep_t *ep);
+int uct_tcp_ep_is_self(const uct_tcp_ep_t *ep);
 
 void uct_tcp_ep_remove(uct_tcp_iface_t *iface, uct_tcp_ep_t *ep);
 
 void uct_tcp_ep_add(uct_tcp_iface_t *iface, uct_tcp_ep_t *ep);
 
-void uct_tcp_ep_mod_events(uct_tcp_ep_t *ep, int add, int remove);
+void uct_tcp_ep_mod_events(uct_tcp_ep_t *ep, ucs_event_set_types_t add,
+                           ucs_event_set_types_t rem);
 
 void uct_tcp_ep_pending_queue_dispatch(uct_tcp_ep_t *ep);
 
@@ -468,7 +446,9 @@ void uct_tcp_ep_pending_purge(uct_ep_h tl_ep, uct_pending_purge_callback_t cb,
 ucs_status_t uct_tcp_ep_flush(uct_ep_h tl_ep, unsigned flags,
                               uct_completion_t *comp);
 
-ucs_status_t uct_tcp_cm_send_event(uct_tcp_ep_t *ep, uct_tcp_cm_conn_event_t event);
+ucs_status_t uct_tcp_cm_send_event(uct_tcp_ep_t *ep,
+                                   uct_tcp_cm_conn_event_t event,
+                                   int log_error);
 
 unsigned uct_tcp_cm_handle_conn_pkt(uct_tcp_ep_t **ep_p, void *pkt, uint32_t length);
 
@@ -481,15 +461,18 @@ uct_tcp_cm_set_conn_state(uct_tcp_ep_t *ep,
 void uct_tcp_cm_change_conn_state(uct_tcp_ep_t *ep,
                                   uct_tcp_ep_conn_state_t new_conn_state);
 
-ucs_status_t uct_tcp_cm_add_ep(uct_tcp_iface_t *iface, uct_tcp_ep_t *ep);
+uct_tcp_cm_conn_sn_t
+uct_tcp_cm_get_conn_sn(uct_tcp_iface_t *iface,
+                       const struct sockaddr_in *dest_address);
+
+uct_tcp_ep_t *uct_tcp_cm_get_ep(uct_tcp_iface_t *iface,
+                                const struct sockaddr_in *dest_address,
+                                uct_tcp_cm_conn_sn_t conn_sn,
+                                uint8_t with_ctx_cap);
+
+void uct_tcp_cm_insert_ep(uct_tcp_iface_t *iface, uct_tcp_ep_t *ep);
 
 void uct_tcp_cm_remove_ep(uct_tcp_iface_t *iface, uct_tcp_ep_t *ep);
-
-uct_tcp_ep_t *uct_tcp_cm_search_ep(uct_tcp_iface_t *iface,
-                                   const struct sockaddr_in *peer_addr,
-                                   uct_tcp_ep_ctx_type_t with_ctx_type);
-
-void uct_tcp_cm_purge_ep(uct_tcp_ep_t *ep);
 
 ucs_status_t uct_tcp_cm_handle_incoming_conn(uct_tcp_iface_t *iface,
                                              const struct sockaddr_in *peer_addr,

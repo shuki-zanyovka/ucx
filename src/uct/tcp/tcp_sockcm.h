@@ -21,6 +21,7 @@ typedef struct uct_tcp_sockcm {
     size_t              sockopt_rcvbuf;  /** SO_RCVBUF */
     unsigned            syn_cnt;         /** TCP_SYNCNT */
     ucs_list_link_t     ep_list;         /** List of endpoints */
+    int                 allow_addr_inuse;
 } uct_tcp_sockcm_t;
 
 /**
@@ -31,6 +32,7 @@ typedef struct uct_tcp_sockcm_config {
     size_t                          priv_data_len;
     uct_tcp_send_recv_buf_config_t  sockopt;
     unsigned                        syn_cnt;
+    int                             allow_addr_inuse;
 } uct_tcp_sockcm_config_t;
 
 
@@ -45,4 +47,4 @@ UCS_CLASS_DECLARE_NEW_FUNC(uct_tcp_sockcm_t, uct_cm_t, uct_component_h,
                            uct_worker_h, const uct_cm_config_t *);
 UCS_CLASS_DECLARE_DELETE_FUNC(uct_tcp_sockcm_t, uct_cm_t);
 
-void uct_tcp_sa_data_handler(int fd, int events, void *arg);
+void uct_tcp_sa_data_handler(int fd, ucs_event_set_types_t events, void *arg);

@@ -481,7 +481,7 @@ void uct_ib_address_unpack(const uct_ib_address_t *ib_addr,
     }
 
     if (ib_addr->flags & UCT_IB_ADDRESS_FLAG_PATH_MTU) {
-        params.path_mtu = *(const uint8_t*)ptr;
+        params.path_mtu = (enum ibv_mtu)*(const uint8_t*)ptr;
         ptr             = UCS_PTR_TYPE_OFFSET(ptr, const uint8_t);
         params.flags   |= UCT_IB_ADDRESS_PACK_FLAG_PATH_MTU;
     }
@@ -653,6 +653,9 @@ void uct_ib_iface_fill_ah_attr_from_gid_lid(uct_ib_iface_t *iface, uint16_t lid,
     if (uct_ib_iface_is_roce(iface)) {
         ah_attr->dlid          = UCT_IB_ROCE_UDP_SRC_PORT_BASE |
                                  (iface->config.roce_path_factor * path_index);
+        /* Workaround rdma-core issue of calling rand() which affects global
+         * random state in glibc */
+        ah_attr->grh.flow_label = 1;
     } else {
         /* TODO iface->path_bits should be removed and replaced by path_index */
         path_bits              = iface->path_bits[path_index %

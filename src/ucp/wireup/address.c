@@ -127,11 +127,14 @@ enum {
 };
 
 
-static size_t ucp_address_iface_attr_size(ucp_worker_t *worker)
+static size_t ucp_address_iface_attr_size(ucp_worker_t *worker,
+                                          uint64_t flags)
 {
-    return ucp_worker_unified_mode(worker) ?
+    return ucp_worker_is_unified_mode(worker) ?
            sizeof(ucp_address_unified_iface_attr_t) :
-           sizeof(ucp_address_packed_iface_attr_t);
+           (sizeof(ucp_address_packed_iface_attr_t) +
+            ((flags & UCP_ADDRESS_PACK_FLAG_TL_RSC_IDX) ?
+             sizeof(uint8_t) : 0));
 }
 
 static uint64_t ucp_worker_iface_can_connect(uct_iface_attr_t *attrs)
@@ -223,7 +226,7 @@ ucp_address_gather_devices(ucp_worker_h worker, ucp_ep_h ep, uint64_t tl_bitmap,
              */
             ucs_for_each_bit(lane, ucp_ep_config(ep)->p2p_lanes) {
                 if (ucp_ep_get_rsc_index(ep, lane) == rsc_index) {
-                    dev->tl_addrs_size += !ucp_worker_unified_mode(worker);
+                    dev->tl_addrs_size += !ucp_worker_is_unified_mode(worker);
                     dev->tl_addrs_size += iface_attr->ep_addr_len;
                     dev->tl_addrs_size += sizeof(uint8_t); /* lane index */
                 }
@@ -235,8 +238,8 @@ ucp_address_gather_devices(ucp_worker_h worker, ucp_ep_h ep, uint64_t tl_bitmap,
         if (flags & UCP_ADDRESS_PACK_FLAG_IFACE_ADDR) {
             /* iface address (its length will be packed in non-unified mode only) */
             dev->tl_addrs_size += iface_attr->iface_addr_len;
-            dev->tl_addrs_size += !ucp_worker_unified_mode(worker); /* if addr length */
-            dev->tl_addrs_size += ucp_address_iface_attr_size(worker);
+            dev->tl_addrs_size += !ucp_worker_is_unified_mode(worker); /* if addr length */
+            dev->tl_addrs_size += ucp_address_iface_attr_size(worker, flags);
         } else {
             dev->tl_addrs_size += 1; /* 0-value for valid unpacking */
         }
@@ -364,8 +367,10 @@ static uint64_t ucp_address_unpack_flags(uint32_t input_flags,
 static int ucp_address_pack_iface_attr(ucp_worker_h worker, void *ptr,
                                        ucp_rsc_index_t rsc_index,
                                        const uct_iface_attr_t *iface_attr,
+                                       unsigned pack_flags,
                                        int enable_atomics)
 {
+    int packed_len;
     ucp_address_packed_iface_attr_t  *packed;
     ucp_address_unified_iface_attr_t *unified;
 
@@ -376,7 +381,7 @@ static int ucp_address_pack_iface_attr(ucp_worker_h worker, void *ptr,
     }
 
 
-    if (ucp_worker_unified_mode(worker)) {
+    if (ucp_worker_is_unified_mode(worker)) {
         /* In unified mode all workers have the same transports and tl bitmap.
          * Just send rsc index, so the remote peer could fetch iface attributes
          * from its local iface. Also send latency overhead, because it
@@ -390,7 +395,7 @@ static int ucp_address_pack_iface_attr(ucp_worker_h worker, void *ptr,
     }
 
     packed                 = ptr;
-    packed->prio_cap_flags = ((uint8_t)iface_attr->priority);
+    packed->prio_cap_flags = (uint8_t)iface_attr->priority;
     packed->overhead       = iface_attr->overhead;
     packed->bandwidth      = iface_attr->bandwidth.dedicated - iface_attr->bandwidth.shared;
     packed->lat_ovh        = iface_attr->latency.c;
@@ -422,7 +427,15 @@ static int ucp_address_pack_iface_attr(ucp_worker_h worker, void *ptr,
         }
     }
 
-    return sizeof(*packed);
+    packed_len = sizeof(*packed);
+
+    if (pack_flags & UCP_ADDRESS_PACK_FLAG_TL_RSC_IDX) {
+        ptr             = packed + 1;
+        *(uint8_t*)ptr  = rsc_index;
+        packed_len     += sizeof(uint8_t);
+    }
+
+    return packed_len;
 }
 
 static ucs_status_t
@@ -436,7 +449,7 @@ ucp_address_unpack_iface_attr(ucp_worker_t *worker,
     ucp_worker_iface_t *wiface;
     ucp_rsc_index_t rsc_idx;
 
-    if (ucp_worker_unified_mode(worker)) {
+    if (ucp_worker_is_unified_mode(worker)) {
         /* Address contains resources index and iface latency overhead
          * (not all iface attrs). */
         unified               = ptr;
@@ -451,12 +464,13 @@ ucp_address_unpack_iface_attr(ucp_worker_t *worker,
         }
 
         /* Just take the rest of iface attrs from the local resource. */
-        wiface                  = ucp_worker_iface(worker, rsc_idx);
-        iface_attr->cap_flags   = wiface->attr.cap.flags;
-        iface_attr->event_flags = wiface->attr.cap.event_flags;
-        iface_attr->priority    = wiface->attr.priority;
-        iface_attr->overhead    = wiface->attr.overhead;
-        iface_attr->bandwidth   = wiface->attr.bandwidth;
+        wiface                    = ucp_worker_iface(worker, rsc_idx);
+        iface_attr->cap_flags     = wiface->attr.cap.flags;
+        iface_attr->event_flags   = wiface->attr.cap.event_flags;
+        iface_attr->priority      = wiface->attr.priority;
+        iface_attr->overhead      = wiface->attr.overhead;
+        iface_attr->bandwidth     = wiface->attr.bandwidth;
+        iface_attr->dst_rsc_index = rsc_idx;
         if (signbit(unified->lat_ovh)) {
             iface_attr->atomic.atomic32.op_flags  = wiface->attr.cap.atomic32.op_flags;
             iface_attr->atomic.atomic32.fop_flags = wiface->attr.cap.atomic32.fop_flags;
@@ -499,13 +513,22 @@ ucp_address_unpack_iface_attr(ucp_worker_t *worker,
     }
 
     *size_p = sizeof(*packed);
+
+    if (unpack_flags & UCP_ADDRESS_PACK_FLAG_TL_RSC_IDX) {
+        ptr                       = packed + 1;
+        iface_attr->dst_rsc_index = *(uint8_t*)ptr;
+        *size_p                  += sizeof(uint8_t);
+    } else {
+        iface_attr->dst_rsc_index = UCP_NULL_RESOURCE;
+    }
+
     return UCS_OK;
 }
 
 static void*
 ucp_address_iface_flags_ptr(ucp_worker_h worker, void *attr_ptr, int attr_len)
 {
-    if (ucp_worker_unified_mode(worker)) {
+    if (ucp_worker_is_unified_mode(worker)) {
         /* In unified mode, rsc_index is packed instead of attrs. Address flags
          * will be packed in the end of rsc_index byte. */
         UCS_STATIC_ASSERT(ucs_offsetof(ucp_address_unified_iface_attr_t,
@@ -521,7 +544,7 @@ ucp_address_iface_flags_ptr(ucp_worker_h worker, void *attr_ptr, int attr_len)
 static void*
 ucp_address_pack_length(ucp_worker_h worker, void *ptr, size_t addr_length)
 {
-    if (ucp_worker_unified_mode(worker)) {
+    if (ucp_worker_is_unified_mode(worker)) {
         return ptr;
     }
 
@@ -544,7 +567,7 @@ ucp_address_unpack_length(ucp_worker_h worker, const void* flags_ptr, const void
      * address last flag is part of lane index */
     ucs_assert(!is_ep_addr || is_last_iface == NULL);
 
-    if (ucp_worker_unified_mode(worker)) {
+    if (ucp_worker_is_unified_mode(worker)) {
         /* In unified mode:
          * - flags are packed with rsc index in ucp_address_unified_iface_attr_t
          * - iface and ep addr lengths are not packed, need to take them from
@@ -696,7 +719,8 @@ static ucs_status_t ucp_address_do_pack(ucp_worker_h worker, ucp_ep_h ep,
             /* Transport information */
             enable_amo = worker->atomic_tls & UCS_BIT(rsc_index);
             attr_len   = ucp_address_pack_iface_attr(worker, ptr, rsc_index,
-                                                     iface_attr, enable_amo);
+                                                     iface_attr, pack_flags,
+                                                     enable_amo);
             if (attr_len < 0) {
                 return UCS_ERR_INVALID_ADDR;
             }
@@ -786,8 +810,9 @@ static ucs_status_t ucp_address_do_pack(ucp_worker_h worker, ucp_ep_h ep,
 
             if (!(pack_flags & UCP_ADDRESS_PACK_FLAG_NO_TRACE)) {
                ucs_trace("pack addr[%d] : "UCT_TL_RESOURCE_DESC_FMT" "
-                          "eps %u md_flags 0x%"PRIx64" tl_flags 0x%"PRIx64" bw %e + %e/n ovh %e "
-                          "lat_ovh %e dev_priority %d a32 0x%lx/0x%lx a64 0x%lx/0x%lx",
+                          "eps %u md_flags 0x%"PRIx64" tl_flags 0x%"PRIx64
+                          " bw %e + %e/n ovh %e lat_ovh %e dev_priority %d a32 "
+                          "0x%"PRIx64"/0x%"PRIx64" a64 0x%"PRIx64"/0x%"PRIx64,
                           addr_index,
                           UCT_TL_RESOURCE_DESC_ARG(&context->tl_rscs[rsc_index].tl_rsc),
                           num_ep_addrs, md_flags, iface_attr->cap.flags,
@@ -1012,7 +1037,7 @@ ucs_status_t ucp_address_unpack(ucp_worker_t *worker, const void *buffer,
                 if (address->num_ep_addrs >= UCP_MAX_LANES) {
                     if (!(unpack_flags & UCP_ADDRESS_PACK_FLAG_NO_TRACE)) {
                         ucs_error("failed to parse address: number of ep addresses"
-                                  "exceeds %d", UCP_MAX_LANES);
+                                  " exceeds %d", UCP_MAX_LANES);
                     }
                     goto err_free;
                 }
@@ -1040,7 +1065,7 @@ ucs_status_t ucp_address_unpack(ucp_worker_t *worker, const void *buffer,
                 ucs_trace("unpack addr[%d] : eps %u md_flags 0x%"PRIx64
                           " tl_iface_flags 0x%"PRIx64" tl_event_flags 0x%"PRIx64
                           " bw %e + %e/n ovh %e lat_ovh %e dev_priority %d a32 "
-                          "0x%lx/0x%lx a64 0x%lx/0x%lx",
+                          "0x%"PRIx64"/0x%"PRIx64" a64 0x%"PRIx64"/0x%"PRIx64,
                           (int)(address - address_list), address->num_ep_addrs,
                           address->md_flags, address->iface_attr.cap_flags,
                           address->iface_attr.event_flags,

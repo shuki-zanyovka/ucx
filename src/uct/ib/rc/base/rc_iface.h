@@ -98,6 +98,11 @@ enum {
 
 /* flags for uct_rc_iface_send_op_t */
 enum {
+#ifdef NVALGRIND
+    UCT_RC_IFACE_SEND_OP_FLAG_IOV   = 0,
+#else
+    UCT_RC_IFACE_SEND_OP_FLAG_IOV   = UCS_BIT(12), /* save iovec to make mem defined */
+#endif
 #if UCS_ENABLE_ASSERT
     UCT_RC_IFACE_SEND_OP_FLAG_ZCOPY = UCS_BIT(13), /* zcopy */
     UCT_RC_IFACE_SEND_OP_FLAG_IFACE = UCS_BIT(14), /* belongs to iface ops buffer */
@@ -121,10 +126,10 @@ typedef struct uct_rc_hdr {
 } UCS_S_PACKED uct_rc_hdr_t;
 
 
-typedef struct uct_rc_fc_request {
+typedef struct uct_rc_pending_req {
     uct_pending_req_t super;
     uct_ep_t          *ep;
-} uct_rc_fc_request_t;
+} uct_rc_pending_req_t;
 
 
 /**
@@ -150,8 +155,8 @@ typedef struct uct_rc_iface_common_config {
         unsigned             retry_count;
         double               rnr_timeout;
         unsigned             rnr_retry_count;
-        unsigned             max_get_ops;
         size_t               max_get_zcopy;
+        size_t               max_get_bytes;
     } tx;
 
     struct {
@@ -178,11 +183,12 @@ typedef struct uct_rc_iface_ops {
                                     const uct_rc_iface_common_config_t *config);
     void                 (*cleanup_rx)(uct_rc_iface_t *iface);
     ucs_status_t         (*fc_ctrl)(uct_ep_t *ep, unsigned op,
-                                    uct_rc_fc_request_t *req);
+                                    uct_rc_pending_req_t *req);
     ucs_status_t         (*fc_handler)(uct_rc_iface_t *iface, unsigned qp_num,
                                        uct_rc_hdr_t *hdr, unsigned length,
                                        uint32_t imm_data, uint16_t lid,
                                        unsigned flags);
+    void                 (*cleanup_qp)(uct_ib_async_event_wait_t *cleanup_ctx);
 } uct_rc_iface_ops_t;
 
 
@@ -196,20 +202,25 @@ struct uct_rc_iface {
     uct_ib_iface_t              super;
 
     struct {
-        ucs_mpool_t             mp;       /* pool for send descriptors */
-        ucs_mpool_t             fc_mp;    /* pool for FC grant pending requests */
-        ucs_mpool_t             flush_mp; /* pool for flush completions */
+        ucs_mpool_t             mp;         /* pool for send descriptors */
+        ucs_mpool_t             pending_mp; /* pool for FC grant and keepalive
+                                               pending requests */
+        ucs_mpool_t             send_op_mp; /* pool for send_op completions */
         /* Credits for completions.
          * May be negative in case mlx5 because we take "num_bb" credits per
          * post to be able to calculate credits of outstanding ops on failure.
          * In case of verbs TL we use QWE number, so 1 post always takes 1
          * credit */
         signed                  cq_available;
-        unsigned                reads_available;
+        ssize_t                 reads_available;
+        ssize_t                 reads_completed;
         uct_rc_iface_send_op_t  *free_ops; /* stack of free send operations */
         ucs_arbiter_t           arbiter;
         uct_rc_iface_send_op_t  *ops_buffer;
         uct_ib_fence_info_t     fi;
+#if UCS_ENABLE_ASSERT
+        int                     in_pending;
+#endif
     } tx;
 
     struct {
@@ -259,6 +270,7 @@ struct uct_rc_iface {
 
     uct_rc_ep_t              **eps[UCT_RC_QP_TABLE_SIZE];
     ucs_list_link_t          ep_list;
+    ucs_list_link_t          ep_gc_list;
 
     /* Progress function (either regular or TM aware) */
     ucs_callback_t           progress;
@@ -284,6 +296,9 @@ struct uct_rc_iface_send_op {
                                                   get_bcopy completions */
     };
     uct_completion_t              *user_comp;
+#ifndef NVALGRIND
+    struct iovec                  *iov;        /* get_zcopy with valgrind */
+#endif
 };
 
 
@@ -326,6 +341,8 @@ void uct_rc_iface_send_desc_init(uct_iface_h tl_iface, void *obj, uct_mem_h memh
 
 void uct_rc_ep_am_zcopy_handler(uct_rc_iface_send_op_t *op, const void *resp);
 
+void uct_rc_iface_cleanup_eps(uct_rc_iface_t *iface);
+
 /**
  * Creates an RC or DCI QP
  */
@@ -364,7 +381,7 @@ ucs_status_t uct_rc_iface_init_rx(uct_rc_iface_t *iface,
 ucs_status_t uct_rc_iface_fence(uct_iface_h tl_iface, unsigned flags);
 
 static UCS_F_ALWAYS_INLINE ucs_status_t
-uct_rc_fc_ctrl(uct_ep_t *ep, unsigned op, uct_rc_fc_request_t *req)
+uct_rc_fc_ctrl(uct_ep_t *ep, unsigned op, uct_rc_pending_req_t *req)
 {
     uct_rc_iface_t *iface   = ucs_derived_of(ep->iface, uct_rc_iface_t);
     uct_rc_iface_ops_t *ops = ucs_derived_of(iface->super.ops,
@@ -385,6 +402,22 @@ static UCS_F_ALWAYS_INLINE int
 uct_rc_iface_have_tx_cqe_avail(uct_rc_iface_t* iface)
 {
     return iface->tx.cq_available > 0;
+}
+
+/**
+ * Release RDMA_READ credits back to RC iface.
+ * RDMA_READ credits are freed in completion callbacks, but not released to
+ * RC iface to avoid OOO sends. Otherwise, if read credit is the only missing
+ * resource and is released in completion callback, next completion callback
+ * will be able to send even if pedning queue is not empty.
+ */
+static UCS_F_ALWAYS_INLINE void
+uct_rc_iface_update_reads(uct_rc_iface_t *iface)
+{
+    ucs_assert(iface->tx.reads_completed >= 0);
+
+    iface->tx.reads_available += iface->tx.reads_completed;
+    iface->tx.reads_completed  = 0;
 }
 
 static UCS_F_ALWAYS_INLINE uct_rc_iface_send_op_t*
@@ -437,7 +470,7 @@ static inline int uct_rc_iface_has_tx_resources(uct_rc_iface_t *iface)
 {
     return uct_rc_iface_have_tx_cqe_avail(iface) &&
            !ucs_mpool_is_empty(&iface->tx.mp) &&
-           (iface->tx.reads_available != 0);
+           (iface->tx.reads_available > 0);
 }
 
 static UCS_F_ALWAYS_INLINE uct_rc_send_handler_t
@@ -468,4 +501,32 @@ uct_rc_iface_fence_relaxed_order(uct_iface_h tl_iface)
 
     return uct_rc_iface_fence(tl_iface, 0);
 }
+
+static UCS_F_ALWAYS_INLINE void
+uct_rc_iface_check_pending(uct_rc_iface_t *iface, ucs_arbiter_group_t *arb_group)
+{
+    ucs_assert(iface->tx.in_pending || ucs_arbiter_group_is_empty(arb_group));
+}
+
+static UCS_F_ALWAYS_INLINE ucs_status_t
+uct_rc_iface_invoke_pending_cb(uct_rc_iface_t *iface, uct_pending_req_t *req)
+{
+    ucs_status_t status;
+
+    ucs_trace_data("progressing pending request %p", req);
+#if UCS_ENABLE_ASSERT
+    iface->tx.in_pending = 1;
+#endif
+
+    status = req->func(req);
+
+#if UCS_ENABLE_ASSERT
+    iface->tx.in_pending = 0;
+#endif
+    ucs_trace_data("status returned from progress pending: %s",
+                   ucs_status_string(status));
+
+    return status;
+}
+
 #endif

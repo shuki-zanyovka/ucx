@@ -10,7 +10,7 @@ jobs:
       name: MLNX
       demands: ${{ parameters.demands }}
     displayName: ${{ parameters.name }} on worker
-    timeoutInMinutes: 240
+    timeoutInMinutes: 360
     strategy:
       matrix:
         ${{ each wid in parameters.worker_ids }}:
@@ -36,5 +36,5 @@ jobs:
           # $AZP_AGENT_ID is set for every self-hosted Azure agent (uniq for one host, from 1 to N)
           EXECUTOR_NUMBER: $(AZP_AGENT_ID)
           RUN_TESTS: yes
-          JENKINS_TEST_PERF: 0
+          JENKINS_TEST_PERF: ${{ parameters.test_perf }}
 

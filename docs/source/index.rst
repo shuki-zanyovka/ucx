@@ -39,6 +39,7 @@ UCX is a member of `UCF consortium <https://www.ucfconsortium.org>`_.
    download
    running
    faq
+   glossaries
 
 
 Quick start
@@ -50,7 +51,7 @@ and run a simple client/server example:
 .. code-block:: console
 
     $ wget https://github.com/openucx/ucx/releases/download/v{RELEASE}/ucx-{RELEASE}.tar.gz
-    $ tar xzf ucx-{RELEASE}tar.gz
+    $ tar xzf ucx-{RELEASE}.tar.gz
     $ cd ucx-{RELEASE}
     $ ./contrib/configure-release --prefix=$PWD/install
     $ make -j8 install

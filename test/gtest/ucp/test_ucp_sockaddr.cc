@@ -15,10 +15,16 @@
 
 extern "C" {
 #include <ucp/core/ucp_listener.h>
+#include <ucp/core/ucp_ep.h>
+#include <ucp/core/ucp_ep.inl>
+#include <ucp/wireup/wireup_cm.h>
+/* TODO: remove when it is not needed anymore */
+#include <uct/tcp/tcp_sockcm_ep.h>
 }
 
 #define UCP_INSTANTIATE_ALL_TEST_CASE(_test_case) \
         UCP_INSTANTIATE_TEST_CASE (_test_case) \
+        UCP_INSTANTIATE_TEST_CASE_TLS(_test_case, all, "all") \
         UCP_INSTANTIATE_TEST_CASE_TLS(_test_case, shm, "shm") \
         UCP_INSTANTIATE_TEST_CASE_TLS(_test_case, dc_ud, "dc_x,ud_v,ud_x,mm") \
         UCP_INSTANTIATE_TEST_CASE_TLS(_test_case, no_ud_ud_x, "dc_x,mm") \
@@ -137,6 +143,33 @@ public:
         return UCS_LOG_FUNC_RC_CONTINUE;
     }
 
+    int is_skip_interface(struct ifaddrs *ifa) {
+        int skip = 0;
+
+        if (!has_transport("tcp") && !has_transport("all") &&
+            !ucs::is_rdmacm_netdev(ifa->ifa_name)) {
+            /* IB transports require an IPoIB/RoCE interface since they
+             * use rdmacm for connection establishment, which supports
+             * only IPoIB IP addresses. therefore, if the interface
+             * isn't as such, we continue to the next one. */
+            skip = 1;
+        } else if (!ucs::is_rdmacm_netdev(ifa->ifa_name) &&
+                   !(GetParam().variant & TEST_MODIFIER_CM)) {
+            /* old client-server API (without CM) ran only with
+             * IPoIB/RoCE interface */
+            skip = 1;
+        } else if ((has_transport("tcp") || has_transport("all")) &&
+                   (ifa->ifa_addr->sa_family == AF_INET6)) {
+            /* the tcp transport (and 'all' which may fallback to tcp_sockcmm)
+             * can run either on an rdma-enabled interface (IPoIB/RoCE)
+             * or any interface with IPv4 address because IPv6 isn't supported
+             * by the tcp transport yet */
+            skip = 1;
+        }
+
+        return skip;
+    }
+
     void get_sockaddr() {
         std::vector<ucs::sock_addr_storage> saddrs;
         struct ifaddrs* ifaddrs;
@@ -147,9 +180,12 @@ public:
 
         for (struct ifaddrs *ifa = ifaddrs; ifa != NULL; ifa = ifa->ifa_next) {
             if (ucs_netif_flags_is_active(ifa->ifa_flags) &&
-                ucs::is_inet_addr(ifa->ifa_addr) &&
-                ucs::is_rdmacm_netdev(ifa->ifa_name))
+                ucs::is_inet_addr(ifa->ifa_addr))
             {
+                if (is_skip_interface(ifa)) {
+                    continue;
+                }
+
                 saddrs.push_back(ucs::sock_addr_storage());
                 status = ucs_sockaddr_sizeof(ifa->ifa_addr, &size);
                 ASSERT_UCS_OK(status);
@@ -164,18 +200,16 @@ public:
             UCS_TEST_SKIP_R("No interface for testing");
         }
 
-        static const std::string ud_or_dc_tls[] = { "ud", "ud_v", "ud_x",
-                                                    "dc", "dc_x", "ib" };
+        static const std::string dc_tls[] = { "dc", "dc_x", "ib" };
 
-        bool has_dc_or_ud = has_any_transport(
-                        std::vector<std::string>(ud_or_dc_tls,
-                                                 ud_or_dc_tls +
-                                                 ucs_array_size(ud_or_dc_tls)));
+        bool has_dc = has_any_transport(
+            std::vector<std::string>(dc_tls,
+                                     dc_tls + ucs_static_array_size(dc_tls)));
 
-        /* FIXME: select random interface, except for UD and DC transports,
-                  which do not yet support having different gid_index for
-                  different UCT endpoints on same iface */
-        int saddr_idx = has_dc_or_ud ? 0 : (ucs::rand() % saddrs.size());
+        /* FIXME: select random interface, except for DC transport, which do not
+                  yet support having different gid_index for different UCT
+                  endpoints on same iface */
+        int saddr_idx = has_dc ? 0 : (ucs::rand() % saddrs.size());
         m_test_addr   = saddrs[saddr_idx];
     }
 
@@ -513,7 +547,8 @@ public:
         case UCS_ERR_REJECTED:
         case UCS_ERR_UNREACHABLE:
         case UCS_ERR_CONNECTION_RESET:
-            UCS_TEST_MESSAGE << "ignoring error " <<ucs_status_string(status)
+        case UCS_ERR_NOT_CONNECTED:
+            UCS_TEST_MESSAGE << "ignoring error " << ucs_status_string(status)
                              << " on endpoint " << ep;
             return;
         default:
@@ -548,6 +583,13 @@ protected:
 
     bool no_close_protocol() const {
         return !(GetParam().variant & TEST_MODIFIER_CM);
+    }
+
+    static void cmp_cfg_lanes(ucp_ep_config_key_t *key1, ucp_lane_index_t lane1,
+                              ucp_ep_config_key_t *key2, ucp_lane_index_t lane2) {
+        EXPECT_TRUE(((lane1 == UCP_NULL_LANE) && (lane2 == UCP_NULL_LANE)) ||
+                    ((lane1 != UCP_NULL_LANE) && (lane2 != UCP_NULL_LANE) &&
+                     ucp_ep_config_lane_is_peer_equal(key1, lane1, key2, lane2)));
     }
 };
 
@@ -691,6 +733,86 @@ UCS_TEST_P(test_ucp_sockaddr, err_handle) {
     }
 
     EXPECT_EQ(1u, sender().get_err_num());
+}
+
+UCS_TEST_SKIP_COND_P(test_ucp_sockaddr, compare_cm_and_wireup_configs,
+                     no_close_protocol()) {
+    ucp_worker_cfg_index_t cm_ep_cfg_index, wireup_ep_cfg_index;
+    ucp_ep_config_key_t *cm_ep_cfg_key, *wireup_ep_cfg_key;
+
+    /* get configuration index for EP created through CM */
+    listen_and_communicate(false, SEND_DIRECTION_C2S);
+    cm_ep_cfg_index = sender().ep()->cfg_index;
+    cm_ep_cfg_key   = &ucp_ep_config(sender().ep())->key;
+    /* TODO: remove the SKIP below and include for <uct/tcp/tcp_sockcm_ep.h>
+     *       header file, when CONNECT_TO_EP support is added for TCP */
+    if (sender().ep()->uct_eps[ucp_ep_get_cm_lane(sender().ep())]
+        ->iface->ops.ep_disconnect == uct_tcp_sockcm_ep_disconnect) {
+        UCS_TEST_SKIP_R("don't test TCP SOCKCM");
+    }
+    EXPECT_NE(UCP_NULL_LANE, ucp_ep_get_cm_lane(sender().ep()));
+    disconnect(sender());
+    disconnect(receiver());
+
+    /* get configuration index for EP created through WIREUP */
+    sender().connect(&receiver(), get_ep_params());
+    ucp_ep_params_t params = get_ep_params();
+    /* initialize user data for STREAM API testing */
+    params.field_mask     |= UCP_EP_PARAM_FIELD_USER_DATA;
+    params.user_data       = &receiver();
+    receiver().connect(&sender(), params);
+    send_recv(sender(), receiver(), send_recv_type(), 0, cb_type());
+    wireup_ep_cfg_index = sender().ep()->cfg_index;
+    wireup_ep_cfg_key   = &ucp_ep_config(sender().ep())->key;
+    EXPECT_EQ(UCP_NULL_LANE, ucp_ep_get_cm_lane(sender().ep()));
+
+    /* EP config indexes must be different because one has CM lane and
+     * the other doesn't */
+    EXPECT_NE(cm_ep_cfg_index, wireup_ep_cfg_index);
+
+    /* EP config RMA BW must be equal */
+    EXPECT_EQ(cm_ep_cfg_key->rma_bw_md_map,
+              wireup_ep_cfg_key->rma_bw_md_map);
+
+    /* compare AM lanes */
+    cmp_cfg_lanes(cm_ep_cfg_key, cm_ep_cfg_key->am_lane,
+                  wireup_ep_cfg_key, wireup_ep_cfg_key->am_lane);
+
+    /* compare TAG lanes */
+    cmp_cfg_lanes(cm_ep_cfg_key, cm_ep_cfg_key->tag_lane,
+                  wireup_ep_cfg_key, wireup_ep_cfg_key->tag_lane);
+
+    /* compare RMA lanes */
+    for (ucp_lane_index_t lane = 0;
+         cm_ep_cfg_key->rma_lanes[lane] != UCP_NULL_LANE; ++lane) {
+        cmp_cfg_lanes(cm_ep_cfg_key, cm_ep_cfg_key->rma_lanes[lane],
+                      wireup_ep_cfg_key, wireup_ep_cfg_key->rma_lanes[lane]);
+    }
+
+    /* compare RMA BW lanes */
+    for (ucp_lane_index_t lane = 0;
+         cm_ep_cfg_key->rma_bw_lanes[lane] != UCP_NULL_LANE; ++lane) {
+        cmp_cfg_lanes(cm_ep_cfg_key, cm_ep_cfg_key->rma_bw_lanes[lane],
+                      wireup_ep_cfg_key, wireup_ep_cfg_key->rma_bw_lanes[lane]);
+    }
+
+    /* compare RKEY PTR lanes */
+    cmp_cfg_lanes(cm_ep_cfg_key, cm_ep_cfg_key->rkey_ptr_lane,
+                  wireup_ep_cfg_key, wireup_ep_cfg_key->rkey_ptr_lane);
+
+    /* compare AMO lanes */
+    for (ucp_lane_index_t lane = 0;
+         cm_ep_cfg_key->amo_lanes[lane] != UCP_NULL_LANE; ++lane) {
+        cmp_cfg_lanes(cm_ep_cfg_key, cm_ep_cfg_key->amo_lanes[lane],
+                      wireup_ep_cfg_key, wireup_ep_cfg_key->amo_lanes[lane]);
+    }
+
+    /* compare AM BW lanes */
+    for (ucp_lane_index_t lane = 0;
+         cm_ep_cfg_key->am_bw_lanes[lane] != UCP_NULL_LANE; ++lane) {
+        cmp_cfg_lanes(cm_ep_cfg_key, cm_ep_cfg_key->am_bw_lanes[lane],
+                      wireup_ep_cfg_key, wireup_ep_cfg_key->am_bw_lanes[lane]);
+    }
 }
 
 UCP_INSTANTIATE_ALL_TEST_CASE(test_ucp_sockaddr)
@@ -972,8 +1094,8 @@ protected:
                                    ucp_dt_make_contig(1), 0, 0, rtag_complete_cb);
         }
 
-        wait(sreq);
-        wait(rreq);
+        request_wait(sreq);
+        request_wait(rreq);
 
         compare_buffers(send_buf, recv_buf);
     }
@@ -1009,8 +1131,8 @@ protected:
                                       &recv_length, UCP_STREAM_RECV_FLAG_WAITALL);
         }
 
-        wait(sreq);
-        wait(rreq);
+        request_wait(sreq);
+        request_wait(rreq);
 
         compare_buffers(send_buf, recv_buf);
     }
@@ -1053,7 +1175,7 @@ protected:
         (this->*rma_func)(send_buf, recv_buf, rkey, reqs);
 
         while (!reqs.empty()) {
-            wait(reqs.back());
+            request_wait(reqs.back());
             reqs.pop_back();
         }
 
@@ -1064,33 +1186,63 @@ protected:
         ASSERT_UCS_OK(status);
     }
 
-    void test_am_send_recv(size_t size)
+    void test_am_send_recv(size_t size, size_t hdr_size = 0ul)
     {
         std::string sb(size, 'x');
+        std::string hdr(hdr_size, 'x');
 
         bool am_received = false;
-        ucp_worker_set_am_handler(receiver().worker(), 0,
-                                  rx_am_msg_cb, &am_received, 0);
 
-        ucs_status_ptr_t sreq = ucp_am_send_nb(sender().ep(), 0, &sb[0], size,
-                                               ucp_dt_make_contig(1),
-                                               scomplete_cb, 0);
-        wait(sreq);
+        set_am_data_handler(receiver(), 0, rx_am_msg_cb, &am_received);
+
+        ucp_request_param_t param = {};
+        ucs_status_ptr_t sreq     = ucp_am_send_nbx(sender().ep(), 0, &hdr[0],
+                                                    hdr_size, &sb[0], size,
+                                                    &param);
+        request_wait(sreq);
         wait_for_flag(&am_received);
         EXPECT_TRUE(am_received);
 
-        ucp_worker_set_am_handler(receiver().worker(), 0, NULL, NULL, 0);
+        set_am_data_handler(receiver(), 0, NULL, NULL);
     }
 
 private:
-    static ucs_status_t rx_am_msg_cb(void *arg, void *data, size_t length,
-                                     ucp_ep_h reply_ep, unsigned flags) {
+    static ucs_status_t rx_am_msg_cb(void *arg, const void *header,
+                                     size_t header_length, void *data,
+                                     size_t length,
+                                     const ucp_am_recv_param_t *param)
+    {
         volatile bool *am_rx = reinterpret_cast<volatile bool*>(arg);
         EXPECT_FALSE(*am_rx);
         *am_rx = true;
         return UCS_OK;
     }
+
+    void set_am_data_handler(entity &e, uint16_t am_id,
+                             ucp_am_recv_callback_t cb, void *arg)
+    {
+        ucp_am_handler_param_t param;
+
+        /* Initialize Active Message data handler */
+        param.field_mask = UCP_AM_HANDLER_PARAM_FIELD_ID |
+                           UCP_AM_HANDLER_PARAM_FIELD_CB |
+                           UCP_AM_HANDLER_PARAM_FIELD_ARG;
+        param.id         = am_id;
+        param.cb         = cb;
+        param.arg        = arg;
+        ASSERT_UCS_OK(ucp_worker_set_am_recv_handler(e.worker(), &param));
+    }
 };
+
+UCS_TEST_P(test_ucp_sockaddr_protocols, stream_short_exp)
+{
+    test_stream_send_recv(1, true);
+}
+
+UCS_TEST_P(test_ucp_sockaddr_protocols, stream_short_unexp)
+{
+    test_stream_send_recv(1, false);
+}
 
 UCS_TEST_P(test_ucp_sockaddr_protocols, tag_zcopy_4k_exp,
            "ZCOPY_THRESH=2k", "RNDV_THRESH=inf")
@@ -1218,36 +1370,50 @@ UCS_TEST_P(test_ucp_sockaddr_protocols, am_short)
     test_am_send_recv(1);
 }
 
-UCS_TEST_P(test_ucp_sockaddr_protocols, am_bcopy_1k, "ZCOPY_THRESH=inf")
+UCS_TEST_P(test_ucp_sockaddr_protocols, am_header_only)
+{
+    ucp_worker_attr_t attr;
+    attr.field_mask = UCP_WORKER_ATTR_FIELD_MAX_AM_HEADER;
+
+    ASSERT_UCS_OK(ucp_worker_query(sender().worker(), &attr));
+    test_am_send_recv(0, attr.max_am_header);
+}
+
+UCS_TEST_P(test_ucp_sockaddr_protocols, am_bcopy_1k,
+           "ZCOPY_THRESH=inf", "RNDV_THRESH=inf")
 {
     test_am_send_recv(1 * UCS_KBYTE);
 }
 
-UCS_TEST_P(test_ucp_sockaddr_protocols, am_bcopy_64k, "ZCOPY_THRESH=inf")
+UCS_TEST_P(test_ucp_sockaddr_protocols, am_bcopy_64k,
+           "ZCOPY_THRESH=inf", "RNDV_THRESH=inf")
 {
     test_am_send_recv(64 * UCS_KBYTE);
 }
 
-UCS_TEST_P(test_ucp_sockaddr_protocols, am_zcopy_1k, "ZCOPY_THRESH=512")
+UCS_TEST_P(test_ucp_sockaddr_protocols, am_zcopy_1k,
+           "ZCOPY_THRESH=512", "RNDV_THRESH=inf")
 {
     test_am_send_recv(1 * UCS_KBYTE);
 }
 
-UCS_TEST_P(test_ucp_sockaddr_protocols, am_zcopy_64k, "ZCOPY_THRESH=512")
+UCS_TEST_P(test_ucp_sockaddr_protocols, am_zcopy_64k,
+           "ZCOPY_THRESH=512", "RNDV_THRESH=inf")
 {
     test_am_send_recv(64 * UCS_KBYTE);
 }
 
 
-/* Only IB transports support CM for now
- * For DC case, allow fallback to UD if DC is not supported
- */
+
+/* For DC case, allow fallback to UD if DC is not supported */
 #define UCP_INSTANTIATE_CM_TEST_CASE(_test_case) \
     UCP_INSTANTIATE_TEST_CASE_TLS(_test_case, dcudx, "dc_x,ud") \
     UCP_INSTANTIATE_TEST_CASE_TLS(_test_case, ud,    "ud_v") \
     UCP_INSTANTIATE_TEST_CASE_TLS(_test_case, udx,   "ud_x") \
     UCP_INSTANTIATE_TEST_CASE_TLS(_test_case, rc,    "rc_v") \
     UCP_INSTANTIATE_TEST_CASE_TLS(_test_case, rcx,   "rc_x") \
-    UCP_INSTANTIATE_TEST_CASE_TLS(_test_case, ib,    "ib")
+    UCP_INSTANTIATE_TEST_CASE_TLS(_test_case, ib,    "ib")   \
+    UCP_INSTANTIATE_TEST_CASE_TLS(_test_case, tcp,   "tcp")  \
+    UCP_INSTANTIATE_TEST_CASE_TLS(_test_case, all,   "all")
 
 UCP_INSTANTIATE_CM_TEST_CASE(test_ucp_sockaddr_protocols)

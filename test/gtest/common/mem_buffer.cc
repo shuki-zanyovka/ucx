@@ -19,11 +19,11 @@
 #  include <cuda.h>
 #  include <cuda_runtime.h>
 
-#define CUDA_CALL(_code) \
+#define CUDA_CALL(_code, _details) \
     do { \
         cudaError_t cerr = _code; \
         if (cerr != cudaSuccess) { \
-            UCS_TEST_ABORT(# _code << " failed"); \
+            UCS_TEST_ABORT(# _code << " failed" << _details); \
         } \
     } while (0)
 
@@ -43,20 +43,42 @@
 #endif
 
 
-std::vector<ucs_memory_type_t> mem_buffer::supported_mem_types()
+bool mem_buffer::is_cuda_supported()
+{
+#if HAVE_CUDA
+    int num_gpus        = 0;
+    cudaError_t cudaErr = cudaGetDeviceCount(&num_gpus);
+    return (cudaErr == cudaSuccess) && (num_gpus > 0);
+#else
+    return false;
+#endif
+}
+
+bool mem_buffer::is_rocm_supported()
+{
+#if HAVE_ROCM
+    int num_gpus;
+    hipError_t hipErr = hipGetDeviceCount(&num_gpus);
+    return (hipErr == hipSuccess) && (num_gpus > 0);
+#else
+    return false;
+#endif
+}
+
+const std::vector<ucs_memory_type_t>&  mem_buffer::supported_mem_types()
 {
     static std::vector<ucs_memory_type_t> vec;
 
     if (vec.empty()) {
         vec.push_back(UCS_MEMORY_TYPE_HOST);
-#if HAVE_CUDA
-        vec.push_back(UCS_MEMORY_TYPE_CUDA);
-        vec.push_back(UCS_MEMORY_TYPE_CUDA_MANAGED);
-#endif
-#if HAVE_ROCM
-        vec.push_back(UCS_MEMORY_TYPE_ROCM);
-        vec.push_back(UCS_MEMORY_TYPE_ROCM_MANAGED);
-#endif
+        if (is_cuda_supported()) {
+            vec.push_back(UCS_MEMORY_TYPE_CUDA);
+            vec.push_back(UCS_MEMORY_TYPE_CUDA_MANAGED);
+        }
+        if (is_rocm_supported()) {
+            vec.push_back(UCS_MEMORY_TYPE_ROCM);
+            vec.push_back(UCS_MEMORY_TYPE_ROCM_MANAGED);
+        }
     }
 
     return vec;
@@ -66,19 +88,23 @@ void *mem_buffer::allocate(size_t size, ucs_memory_type_t mem_type)
 {
     void *ptr;
 
+    if (size == 0) {
+        return NULL;
+    }
+
     switch (mem_type) {
     case UCS_MEMORY_TYPE_HOST:
         ptr = malloc(size);
         if (ptr == NULL) {
-            UCS_TEST_ABORT("malloc() failed");
+            UCS_TEST_ABORT("malloc(size=" << size << ") failed");
         }
         return ptr;
 #if HAVE_CUDA
     case UCS_MEMORY_TYPE_CUDA:
-        CUDA_CALL(cudaMalloc(&ptr, size));
+        CUDA_CALL(cudaMalloc(&ptr, size), ": size=" << size);
         return ptr;
     case UCS_MEMORY_TYPE_CUDA_MANAGED:
-        CUDA_CALL(cudaMallocManaged(&ptr, size));
+        CUDA_CALL(cudaMallocManaged(&ptr, size), ": size=" << size);
         return ptr;
 #endif
 #if HAVE_ROCM
@@ -104,7 +130,7 @@ void mem_buffer::release(void *ptr, ucs_memory_type_t mem_type)
 #if HAVE_CUDA
     case UCS_MEMORY_TYPE_CUDA:
     case UCS_MEMORY_TYPE_CUDA_MANAGED:
-        CUDA_CALL(cudaFree(ptr));
+        CUDA_CALL(cudaFree(ptr), ": ptr=" << ptr);
         break;
 #endif
 #if HAVE_ROCM
@@ -204,8 +230,9 @@ void mem_buffer::copy_to(void *dst, const void *src, size_t length,
         break;
 #if HAVE_CUDA
     case UCS_MEMORY_TYPE_CUDA:
-        CUDA_CALL(cudaMemcpy(dst, src, length, cudaMemcpyHostToDevice));
-        CUDA_CALL(cudaDeviceSynchronize());
+        CUDA_CALL(cudaMemcpy(dst, src, length, cudaMemcpyHostToDevice),
+                  ": dst=" << dst << " src=" << src << "length=" << length);
+        CUDA_CALL(cudaDeviceSynchronize(), "");
         break;
 #endif
 #if HAVE_ROCM
@@ -230,8 +257,9 @@ void mem_buffer::copy_from(void *dst, const void *src, size_t length,
         break;
 #if HAVE_CUDA
     case UCS_MEMORY_TYPE_CUDA:
-        CUDA_CALL(cudaMemcpy(dst, src, length, cudaMemcpyDeviceToHost));
-        CUDA_CALL(cudaDeviceSynchronize());
+        CUDA_CALL(cudaMemcpy(dst, src, length, cudaMemcpyDeviceToHost),
+                  ": dst=" << dst << " src=" << src << "length=" << length);
+        CUDA_CALL(cudaDeviceSynchronize(), "");
         break;
 #endif
 #if HAVE_ROCM
@@ -255,6 +283,32 @@ bool mem_buffer::compare(const void *expected, const void *buffer,
         copy_from(*temp, buffer, length, mem_type);
         return memcmp(expected, *temp, length) == 0;
     }
+}
+
+bool mem_buffer::compare(const void *expected, const void *buffer,
+                         size_t length, ucs_memory_type_t mem_type_expected,
+                         ucs_memory_type_t mem_type_buffer)
+{
+    ucs::handle<void*> expected_copy, buffer_copy;
+    const void *expected_host, *buffer_host;
+
+    if (UCP_MEM_IS_ACCESSIBLE_FROM_CPU(mem_type_expected)) {
+        expected_host = expected;
+    } else {
+        expected_copy.reset(malloc(length), free);
+        copy_from(expected_copy.get(), expected, length, mem_type_expected);
+        expected_host = expected_copy.get();
+    }
+
+    if (UCP_MEM_IS_ACCESSIBLE_FROM_CPU(mem_type_buffer)) {
+        buffer_host = buffer;
+    } else {
+        buffer_copy.reset(malloc(length), free);
+        copy_from(buffer_copy.get(), buffer, length, mem_type_buffer);
+        buffer_host = buffer_copy.get();
+    }
+
+    return memcmp(expected_host, buffer_host, length) == 0;
 }
 
 std::string mem_buffer::mem_type_name(ucs_memory_type_t mem_type)

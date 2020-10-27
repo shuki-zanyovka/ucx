@@ -10,6 +10,7 @@
 
 #include "proto_am.inl"
 
+#include <ucp/core/ucp_request.inl>
 #include <ucp/tag/offload.h>
 
 
@@ -30,13 +31,13 @@ static size_t ucp_proto_pack(void *dest, void *arg)
     case UCP_AM_ID_RNDV_ATS:
     case UCP_AM_ID_RNDV_ATP:
         rep_hdr = dest;
-        rep_hdr->reqptr = req->send.proto.remote_request;
+        rep_hdr->req_id = req->send.proto.remote_req_id;
         rep_hdr->status = req->send.proto.status;
         return sizeof(*rep_hdr);
     case UCP_AM_ID_OFFLOAD_SYNC_ACK:
         off_rep_hdr = dest;
         off_rep_hdr->sender_tag = req->send.proto.sender_tag;
-        off_rep_hdr->ep_ptr     = ucp_request_get_dest_ep_ptr(req);
+        off_rep_hdr->ep_id      = ucp_send_request_get_ep_remote_id(req);
         return sizeof(*off_rep_hdr);
     }
 
@@ -91,16 +92,16 @@ void ucp_proto_am_zcopy_req_complete(ucp_request_t *req, ucs_status_t status)
     ucp_request_complete_send(req, status);
 }
 
-void ucp_proto_am_zcopy_completion(uct_completion_t *self,
-                                    ucs_status_t status)
+void ucp_proto_am_zcopy_completion(uct_completion_t *self)
 {
-    ucp_request_t *req = ucs_container_of(self, ucp_request_t,
-                                          send.state.uct_comp);
+    ucp_request_t *req  = ucs_container_of(self, ucp_request_t,
+                                           send.state.uct_comp);
+
     if (req->send.state.dt.offset == req->send.length) {
-        ucp_proto_am_zcopy_req_complete(req, status);
-    } else if (status != UCS_OK) {
+        ucp_proto_am_zcopy_req_complete(req, self->status);
+    } else if (self->status != UCS_OK) {
         ucs_assert(req->send.state.uct_comp.count == 0);
-        ucs_assert(status != UCS_INPROGRESS);
+        ucs_assert(self->status != UCS_INPROGRESS);
 
         /* NOTE: the request is in pending queue if data was not completely sent,
          *       just dereg the buffer here and complete request on purge

@@ -20,7 +20,9 @@
     UCT_RC_CHECK_CQE_RET(&(_iface)->super, &(_ep)->super, \
                          UCS_STATUS_PTR(UCS_ERR_NO_RESOURCE)) \
     UCT_RC_CHECK_TXQP_RET(&(_iface)->super, &(_ep)->super, \
-                          UCS_STATUS_PTR(UCS_ERR_NO_RESOURCE))
+                          UCS_STATUS_PTR(UCS_ERR_NO_RESOURCE)) \
+    UCT_RC_CHECK_NUM_RDMA_READ_RET(&(_iface)->super, \
+                                   UCS_STATUS_PTR(UCS_ERR_NO_RESOURCE))
 
 
 /**
@@ -33,7 +35,6 @@ typedef struct uct_rc_mlx5_ep {
     } tx;
     uct_ib_mlx5_qp_t         tm_qp;
     uct_rc_mlx5_mp_context_t mp;
-    uint16_t                 atomic_mr_offset;
 } uct_rc_mlx5_ep_t;
 
 typedef struct uct_rc_mlx5_ep_address {
@@ -110,15 +111,22 @@ ucs_status_t uct_rc_mlx5_ep_atomic32_fetch(uct_ep_h ep, uct_atomic_op_t opcode,
 
 ucs_status_t uct_rc_mlx5_ep_fence(uct_ep_h tl_ep, unsigned flags);
 
+ucs_status_t uct_rc_mlx5_ep_check(uct_ep_h tl_ep, unsigned flags, uct_completion_t *comp);
+
 ucs_status_t uct_rc_mlx5_ep_flush(uct_ep_h tl_ep, unsigned flags, uct_completion_t *comp);
 
 ucs_status_t uct_rc_mlx5_ep_fc_ctrl(uct_ep_t *tl_ep, unsigned op,
-                                    uct_rc_fc_request_t *req);
+                                    uct_rc_pending_req_t *req);
 
 ucs_status_t uct_rc_mlx5_iface_create_qp(uct_rc_mlx5_iface_common_t *iface,
                                          uct_ib_mlx5_qp_t *qp,
                                          uct_ib_mlx5_txwq_t *txwq,
                                          uct_ib_mlx5_qp_attr_t *attr);
+
+ucs_status_t
+uct_rc_mlx5_ep_connect_qp(uct_rc_mlx5_iface_common_t *iface,
+                          uct_ib_mlx5_qp_t *qp, uint32_t qp_num,
+                          struct ibv_ah_attr *ah_attr, enum ibv_mtu path_mtu);
 
 ucs_status_t uct_rc_mlx5_ep_connect_to_ep(uct_ep_h tl_ep,
                                           const uct_device_addr_t *dev_addr,
@@ -154,9 +162,15 @@ ucs_status_t uct_rc_mlx5_ep_tag_rndv_request(uct_ep_h tl_ep, uct_tag_t tag,
 ucs_status_t uct_rc_mlx5_ep_get_address(uct_ep_h tl_ep, uct_ep_addr_t *addr);
 
 ucs_status_t uct_rc_mlx5_ep_handle_failure(uct_rc_mlx5_ep_t *ep,
-                                           ucs_status_t status);
+                                           ucs_status_t status, uint16_t sn);
 
 ucs_status_t uct_rc_mlx5_ep_set_failed(uct_ib_iface_t *iface, uct_ep_h ep,
                                        ucs_status_t status);
+
+void uct_rc_mlx5_ep_pending_purge(uct_ep_h tl_ep,
+                                  uct_pending_purge_callback_t cb,
+                                  void *arg);
+
+void uct_rc_mlx5_ep_cleanup_qp(uct_ib_async_event_wait_t *wait_ctx);
 
 #endif

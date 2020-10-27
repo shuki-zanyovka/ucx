@@ -22,13 +22,6 @@ uct_rc_verbs_txqp_posted(uct_rc_txqp_t *txqp, uct_rc_verbs_txcnt_t *txcnt,
     uct_rc_txqp_posted(txqp, iface, 1, signaled);
 }
 
-static inline void
-uct_rc_verbs_txqp_completed(uct_rc_txqp_t *txqp, uct_rc_verbs_txcnt_t *txcnt, uint16_t count)
-{
-    txcnt->ci += count;
-    uct_rc_txqp_available_add(txqp, count);
-}
-
 ucs_status_t uct_rc_verbs_iface_common_prepost_recvs(uct_rc_verbs_iface_t *iface,
                                                      unsigned max);
 
@@ -52,29 +45,6 @@ static inline unsigned uct_rc_verbs_iface_post_recv_common(uct_rc_verbs_iface_t 
         count = batch;
     }
     return uct_rc_verbs_iface_post_recv_always(iface, count);
-}
-
-
-/* TODO: think of a better name */
-static inline int
-uct_rc_verbs_txcq_get_comp_count(struct ibv_wc *wc, uct_rc_txqp_t *txqp)
-{
-    uint16_t count = 1;
-
-    if (ucs_likely(wc->wr_id != RC_UNSIGNALED_INF)) {
-        return wc->wr_id + 1;
-    }
-
-    ucs_assert(txqp->unsignaled_store != RC_UNSIGNALED_INF);
-    ucs_assert(txqp->unsignaled_store_count != 0);
-
-    txqp->unsignaled_store_count--;
-    if (txqp->unsignaled_store_count == 0) {
-        count += txqp->unsignaled_store;
-        txqp->unsignaled_store = 0;
-    }
-
-    return count;
 }
 
 static UCS_F_ALWAYS_INLINE void
@@ -107,6 +77,7 @@ uct_rc_verbs_iface_handle_am(uct_rc_iface_t *iface, uct_rc_hdr_t *hdr,
 static UCS_F_ALWAYS_INLINE unsigned
 uct_rc_verbs_iface_poll_rx_common(uct_rc_verbs_iface_t *iface)
 {
+    uct_ib_iface_recv_desc_t *desc;
     uct_rc_hdr_t *hdr;
     unsigned i;
     ucs_status_t status;
@@ -119,7 +90,21 @@ uct_rc_verbs_iface_poll_rx_common(uct_rc_verbs_iface_t *iface)
         goto out;
     }
 
-    UCT_IB_IFACE_VERBS_FOREACH_RXWQE(&iface->super.super, i, hdr, wc, num_wcs) {
+    for (i = 0; i < num_wcs; i++) {
+        desc = (uct_ib_iface_recv_desc_t *)(uintptr_t)wc[i].wr_id;
+        hdr  = (uct_rc_hdr_t *)uct_ib_iface_recv_desc_hdr(&iface->super.super, desc);
+        if (ucs_unlikely(wc[i].status != IBV_WC_SUCCESS)) {
+            if (wc[i].status == IBV_WC_REM_ABORT_ERR) {
+                continue;
+            }
+            /* we can get flushed messages during ep destroy */
+            if (wc[i].status == IBV_WC_WR_FLUSH_ERR) {
+                continue;
+            }
+            UCT_IB_IFACE_VERBS_COMPLETION_ERR("receive", &iface->super.super, i, wc);
+        }
+        VALGRIND_MAKE_MEM_DEFINED(hdr, wc[i].byte_len);
+
         uct_ib_log_recv_completion(&iface->super.super, &wc[i], hdr, wc[i].byte_len,
                                    uct_rc_ep_packet_dump);
         uct_rc_verbs_iface_handle_am(&iface->super, hdr, wc[i].wr_id, wc[i].qp_num,
@@ -178,13 +163,13 @@ uct_rc_verbs_iface_fill_inl_am_sge(uct_rc_verbs_iface_t *iface,
                                   _sge, _length, _raddr, _rkey) \
     UCT_RC_VERBS_FILL_SGE(_wr, _sge, _length) \
     _wr.wr.rdma.remote_addr = _raddr; \
-    _wr.wr.rdma.rkey        = uct_ib_md_direct_rkey(_rkey); \
+    _wr.wr.rdma.rkey        = _rkey; \
     _wr_opcode              = _opcode; \
 
 #define UCT_RC_VERBS_FILL_RDMA_WR_IOV(_wr, _wr_opcode, _opcode, _sge, _sgelen, \
                                       _raddr, _rkey) \
     _wr.wr.rdma.remote_addr = _raddr; \
-    _wr.wr.rdma.rkey        = uct_ib_md_direct_rkey(_rkey); \
+    _wr.wr.rdma.rkey        = _rkey; \
     _wr.sg_list             = _sge; \
     _wr.num_sge             = _sgelen; \
     _wr_opcode              = _opcode;

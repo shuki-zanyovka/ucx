@@ -293,7 +293,7 @@ protected:
         }
 
         void signal();
-        bool wait_for_event(entity &e, int timeout);
+        bool wait_for_event(entity &e, double timeout_sec);
 
     private:
         struct pollfd    wakeup_fd;
@@ -358,7 +358,7 @@ protected:
     virtual void init();
     virtual void cleanup();
     virtual void modify_config(const std::string& name, const std::string& value,
-                               bool optional = false);
+                               modify_config_mode_t mode = FAIL_IF_NOT_EXIST);
     bool get_config(const std::string& name, std::string& value) const;
     void stats_activate();
     void stats_restore();
@@ -368,6 +368,8 @@ protected:
     virtual bool has_rc() const;
     virtual bool has_rc_or_dc() const;
     virtual bool has_ib() const;
+    virtual bool has_mm() const;
+    virtual bool has_cma() const;
 
     bool is_caps_supported(uint64_t required_flags);
     bool check_caps(uint64_t required_flags, uint64_t invalid_flags = 0);

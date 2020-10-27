@@ -304,6 +304,12 @@ void *mmap_fixed_address();
 std::string compact_string(const std::string &str, size_t length);
 
 
+/*
+ * Converts exit status from waitpid()/system() to a status string
+ */
+std::string exit_status_info(int exit_status);
+
+
 /**
  * Return the IP address of the given interface address.
  */
@@ -399,7 +405,7 @@ static void fill_random(C& c, size_t size) {
 template <typename T>
 static inline T random_upper() {
   return static_cast<T>((rand() / static_cast<double>(RAND_MAX)) *
-                        std::numeric_limits<T>::max());
+                        static_cast<double>(std::numeric_limits<T>::max()));
 }
 
 template <typename T>
@@ -792,7 +798,6 @@ template <typename T>
 static void deleter(T *ptr) {
     delete ptr;
 }
-
 
 extern int    perf_retry_count;
 extern double perf_retry_interval;

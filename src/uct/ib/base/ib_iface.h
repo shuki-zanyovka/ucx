@@ -21,7 +21,7 @@
 #define UCT_IB_IFACE_NULL_RES_DOMAIN_KEY   0u
 #define UCT_IB_MAX_ATOMIC_SIZE             sizeof(uint64_t)
 #define UCT_IB_ADDRESS_INVALID_GID_INDEX   UINT8_MAX
-#define UCT_IB_ADDRESS_INVALID_PATH_MTU    0
+#define UCT_IB_ADDRESS_INVALID_PATH_MTU    ((enum ibv_mtu)0)
 #define UCT_IB_ADDRESS_INVALID_PKEY        0
 #define UCT_IB_ADDRESS_DEFAULT_PKEY        0xffff
 
@@ -596,6 +596,21 @@ static UCS_F_ALWAYS_INLINE void
 uct_ib_fence_info_init(uct_ib_fence_info_t* fence)
 {
     fence->fence_beat = 0;
+}
+
+static UCS_F_ALWAYS_INLINE
+ucs_log_level_t uct_ib_iface_failure_log_level(uct_ib_iface_t *ib_iface,
+                                               ucs_status_t err_handler_status,
+                                               ucs_status_t status)
+{
+    if (err_handler_status != UCS_OK) {
+        return UCS_LOG_LEVEL_FATAL;
+    } else if ((status == UCS_ERR_ENDPOINT_TIMEOUT) ||
+               (status == UCS_ERR_CONNECTION_RESET)) {
+        return ib_iface->super.config.failure_level;
+    } else {
+        return UCS_LOG_LEVEL_ERROR;
+    }
 }
 
 #endif

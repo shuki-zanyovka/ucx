@@ -14,6 +14,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <math.h>
+#include <ucs/arch/bitops.h>
+#include <ucs/type/status.h>
 
 BEGIN_C_DECLS
 
@@ -146,9 +148,6 @@ static inline double ucs_log2(double x)
 #define UCS_CIRCULAR_COMPARE32(__a, __op, __b)  UCS_CIRCULAR_COMPARE(__a, __op, __b, int32_t)
 #define UCS_CIRCULAR_COMPARE64(__a, __op, __b)  UCS_CIRCULAR_COMPARE(__a, __op, __b, int64_t)
 
-/* on some arch ffs64(0) returns 0, on other -1, let's unify this */
-#define ucs_ffs64_safe(_val) ((_val) ? ucs_ffs64(_val) : 64)
-
 #define ucs_for_each_bit(_index, _map)                   \
     for ((_index) = ucs_ffs64_safe(_map); (_index) < 64; \
          (_index) = ucs_ffs64_safe((uint64_t)(_map) & (-2ull << (uint64_t)(_index))))
@@ -158,6 +157,30 @@ static inline double ucs_log2(double x)
  * Generate a large prime number
  */
 uint64_t ucs_get_prime(unsigned index);
+
+
+/*
+ * Generate a random seed
+ */
+void ucs_rand_seed_init();
+
+
+/*
+ * Generate a random number in the range 0..RAND_MAX
+ */
+int ucs_rand();
+
+
+/*
+ * Generate a random number in the given range (inclusive)
+ *
+ * @param [in]  range_min       Beginning of the range
+ * @param [in]  range_max       End of the range
+ * @param [out] rand_val        The generated random number
+ *
+ * @retrun UCS_OK on success or an error status on failure.
+ */
+ucs_status_t ucs_rand_range(int range_min, int range_max, int *rand_val);
 
 END_C_DECLS
 

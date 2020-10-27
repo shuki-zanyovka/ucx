@@ -47,16 +47,17 @@ UCS_TEST_F(test_obj_size, size) {
     UCS_TEST_SKIP_R("Assert enabled");
 #else
     EXPECTED_SIZE(ucp_ep_t, 64);
-    EXPECTED_SIZE(ucp_request_t, 240);
+    /* TODO reduce request size to 240 or less after removing old protocols state */
+    EXPECTED_SIZE(ucp_request_t, 296);
     EXPECTED_SIZE(ucp_recv_desc_t, 48);
     EXPECTED_SIZE(uct_ep_t, 8);
     EXPECTED_SIZE(uct_base_ep_t, 8);
     EXPECTED_SIZE(uct_rkey_bundle_t, 24);
     EXPECTED_SIZE(uct_self_ep_t, 8);
-    EXPECTED_SIZE(uct_tcp_ep_t, 160);
+    EXPECTED_SIZE(uct_tcp_ep_t, 152);
 #  if HAVE_TL_RC
     EXPECTED_SIZE(uct_rc_ep_t, 64);
-    EXPECTED_SIZE(uct_rc_verbs_ep_t, 80);
+    EXPECTED_SIZE(uct_rc_verbs_ep_t, 96);
 #  endif
 #  if HAVE_TL_DC
     EXPECTED_SIZE(uct_dc_mlx5_ep_t, 32);

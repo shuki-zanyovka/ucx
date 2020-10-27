@@ -9,7 +9,7 @@
 #endif
 
 #include "eager.h"
-#include "rndv.h"
+#include "tag_rndv.h"
 #include "tag_match.inl"
 #include "offload.h"
 
@@ -25,18 +25,21 @@ ucp_tag_recv_common(ucp_worker_h worker, void *buffer, size_t count,
                     ucp_request_t *req, ucp_recv_desc_t *rdesc,
                     const ucp_request_param_t *param, const char *debug_name)
 {
-    unsigned common_flags = UCP_REQUEST_FLAG_RECV | UCP_REQUEST_FLAG_EXPECTED;
+    unsigned common_flags = UCP_REQUEST_FLAG_RECV_TAG |
+                            UCP_REQUEST_FLAG_EXPECTED;
     uint32_t req_flags    = (param->op_attr_mask & UCP_OP_ATTR_FIELD_CALLBACK) ?
                             UCP_REQUEST_FLAG_CALLBACK : 0;
     ucp_eager_first_hdr_t *eagerf_hdr;
     ucp_request_queue_t *req_queue;
-    ucs_memory_type_t mem_type;
+    ucs_memory_type_t memory_type;
     size_t hdr_len, recv_len;
     ucs_status_t status;
     uint64_t msg_id;
 
     ucp_trace_req(req, "%s buffer %p dt 0x%lx count %zu tag %"PRIx64"/%"PRIx64,
                   debug_name, buffer, datatype, count, tag, tag_mask);
+
+    memory_type = ucp_request_param_mem_type(param);
 
     /* First, check the fast path case - single fragment
      * in this case avoid initializing most of request fields
@@ -51,15 +54,15 @@ ucp_tag_recv_common(ucp_worker_h worker, void *buffer, size_t count,
         }
 
         req->flags                    = UCP_REQUEST_FLAG_COMPLETED |
-                                        UCP_REQUEST_FLAG_RECV;
+                                        UCP_REQUEST_FLAG_RECV_TAG;
         hdr_len                       = rdesc->payload_offset;
         recv_len                      = rdesc->length - hdr_len;
         req->recv.tag.info.sender_tag = ucp_rdesc_get_tag(rdesc);
         req->recv.tag.info.length     = recv_len;
-        mem_type                      = ucp_memory_type_detect(worker->context,
-                                                               buffer, recv_len);
+        memory_type                   = ucp_get_memory_type(worker->context, buffer,
+                                                            recv_len, memory_type);
 
-        status = ucp_dt_unpack_only(worker, buffer, count, datatype, mem_type,
+        status = ucp_dt_unpack_only(worker, buffer, count, datatype, memory_type,
                                     UCS_PTR_BYTE_OFFSET(rdesc + 1, hdr_len),
                                     recv_len, 1);
         ucp_recv_desc_release(rdesc);
@@ -67,8 +70,7 @@ ucp_tag_recv_common(ucp_worker_h worker, void *buffer, size_t count,
         req->status = status;
         UCS_PROFILE_REQUEST_EVENT(req, "complete_recv", 0);
 
-        ucp_request_imm_cmpl_param(param, req, status, recv,
-                                   &req->recv.tag.info);
+        ucp_request_imm_cmpl_param(param, req, recv, &req->recv.tag.info);
     }
 
     /* TODO: allocate request only in case if flag
@@ -93,8 +95,8 @@ ucp_tag_recv_common(ucp_worker_h worker, void *buffer, size_t count,
     req->flags              = common_flags | req_flags;
     req->recv.length        = ucp_dt_length(datatype, count, buffer,
                                             &req->recv.state);
-    req->recv.mem_type      = ucp_memory_type_detect(worker->context, buffer,
-                                                     req->recv.length);
+    req->recv.mem_type      = ucp_get_memory_type(worker->context, buffer,
+                                                  req->recv.length, memory_type);
     req->recv.tag.tag       = tag;
     req->recv.tag.tag_mask  = tag_mask;
     if (param->op_attr_mask & UCP_OP_ATTR_FIELD_CALLBACK) {
@@ -124,8 +126,8 @@ ucp_tag_recv_common(ucp_worker_h worker, void *buffer, size_t count,
 
     /* Check rendezvous case */
     if (ucs_unlikely(rdesc->flags & UCP_RECV_DESC_FLAG_RNDV)) {
-        ucp_rndv_matched(worker, req, (void*)(rdesc + 1));
-        UCP_WORKER_STAT_RNDV(worker, UNEXP);
+        ucp_tag_rndv_matched(worker, req, ucp_tag_rndv_rts_from_rdesc(rdesc));
+        UCP_WORKER_STAT_RNDV(worker, UNEXP, 1);
         ucp_recv_desc_release(rdesc);
         return req + 1;
     }
@@ -139,13 +141,14 @@ ucp_tag_recv_common(ucp_worker_h worker, void *buffer, size_t count,
     eagerf_hdr                    = (void*)(rdesc + 1);
     req->recv.tag.info.sender_tag = ucp_rdesc_get_tag(rdesc);
     req->recv.tag.info.length     =
-    req->recv.tag.remaining       = eagerf_hdr->total_len;
+    req->recv.remaining           = eagerf_hdr->total_len;
 
     /* process first fragment */
     UCP_WORKER_STAT_EAGER_CHUNK(worker, UNEXP);
     msg_id = eagerf_hdr->msg_id;
     status = ucp_tag_recv_request_process_rdesc(req, rdesc, 0);
-    ucs_assert((status == UCS_OK) || (status == UCS_INPROGRESS));
+    ucs_assert((status == UCS_OK) || (status == UCS_INPROGRESS) ||
+               (status == UCS_ERR_MESSAGE_TRUNCATED));
 
     /* process additional fragments */
     ucp_tag_frag_list_process_queue(&worker->tm, req, msg_id
@@ -156,7 +159,7 @@ ucp_tag_recv_common(ucp_worker_h worker, void *buffer, size_t count,
 UCS_PROFILE_FUNC(ucs_status_t, ucp_tag_recv_nbr,
                  (worker, buffer, count, datatype, tag, tag_mask, request),
                  ucp_worker_h worker, void *buffer, size_t count,
-                 uintptr_t datatype, ucp_tag_t tag, ucp_tag_t tag_mask,
+                 ucp_datatype_t datatype, ucp_tag_t tag, ucp_tag_t tag_mask,
                  void *request)
 {
     ucp_request_param_t param = {
@@ -175,7 +178,7 @@ UCS_PROFILE_FUNC(ucs_status_t, ucp_tag_recv_nbr,
 UCS_PROFILE_FUNC(ucs_status_ptr_t, ucp_tag_recv_nb,
                  (worker, buffer, count, datatype, tag, tag_mask, cb),
                  ucp_worker_h worker, void *buffer, size_t count,
-                 uintptr_t datatype, ucp_tag_t tag, ucp_tag_t tag_mask,
+                 ucp_datatype_t datatype, ucp_tag_t tag, ucp_tag_t tag_mask,
                  ucp_tag_recv_callback_t cb)
 {
     ucp_request_param_t param = {
@@ -204,16 +207,14 @@ UCS_PROFILE_FUNC(ucs_status_ptr_t, ucp_tag_recv_nbx,
                                     return UCS_STATUS_PTR(UCS_ERR_INVALID_PARAM));
     UCP_WORKER_THREAD_CS_ENTER_CONDITIONAL(worker);
 
-    datatype = (param->op_attr_mask & UCP_OP_ATTR_FIELD_DATATYPE) ?
-               param->datatype : ucp_dt_make_contig(1);
+    datatype = ucp_request_param_datatype(param);
+    req      = ucp_request_get_param(worker, param,
+                                     {ret = UCS_STATUS_PTR(UCS_ERR_NO_MEMORY);
+                                      goto out;});
 
-    req = ucp_request_get_param(worker, param,
-                                {ret = UCS_STATUS_PTR(UCS_ERR_NO_MEMORY);
-                                 goto out;});
-
-    rdesc = ucp_tag_unexp_search(&worker->tm, tag, tag_mask, 1, "recv_nbx");
-    ret   = ucp_tag_recv_common(worker, buffer, count, datatype, tag, tag_mask, req,
-                                rdesc, param, "recv_nbx");
+    rdesc    = ucp_tag_unexp_search(&worker->tm, tag, tag_mask, 1, "recv_nbx");
+    ret      = ucp_tag_recv_common(worker, buffer, count, datatype, tag,
+                                   tag_mask, req, rdesc, param, "recv_nbx");
 
 out:
     UCP_WORKER_THREAD_CS_EXIT_CONDITIONAL(worker);
@@ -223,7 +224,7 @@ out:
 UCS_PROFILE_FUNC(ucs_status_ptr_t, ucp_tag_msg_recv_nb,
                  (worker, buffer, count, datatype, message, cb),
                  ucp_worker_h worker, void *buffer, size_t count,
-                 uintptr_t datatype, ucp_tag_message_h message,
+                 ucp_datatype_t datatype, ucp_tag_message_h message,
                  ucp_tag_recv_callback_t cb)
 {
     ucp_request_param_t param = {

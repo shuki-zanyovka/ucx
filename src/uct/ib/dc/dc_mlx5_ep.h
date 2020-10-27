@@ -16,14 +16,21 @@
 #define UCT_DC_MLX5_EP_NO_DCI ((uint8_t)-1)
 
 
-enum {
+enum uct_dc_mlx5_ep_flags {
+    UCT_DC_MLX5_EP_FLAG_TX_WAIT           = UCS_BIT(0), /* ep is in the tx_wait state. See
+                                                           description of the dcs+quota dci
+                                                           selection policy above */
+    UCT_DC_MLX5_EP_FLAG_GRH               = UCS_BIT(1), /* ep has GRH address. Used by
+                                                           dc_mlx5 endpoint */
+    UCT_DC_MLX5_EP_FLAG_VALID             = UCS_BIT(2), /* ep is a valid endpoint */
     /* Indicates that FC grant has been requested, but is not received yet.
      * Flush will not complete until an outgoing grant request is acked.
      * It is needed to avoid the following cases:
      * 1) Grant arrives for the recently deleted ep.
      * 2) QP resources are available, but there are some pending requests. */
-    UCT_DC_MLX5_EP_FC_FLAG_WAIT_FOR_GRANT = UCS_BIT(0)
+    UCT_DC_MLX5_EP_FLAG_FC_WAIT_FOR_GRANT = UCS_BIT(3)
 };
+
 
 struct uct_dc_mlx5_ep {
     /*
@@ -165,7 +172,7 @@ ucs_status_t uct_dc_mlx5_ep_fence(uct_ep_h tl_ep, unsigned flags);
 ucs_status_t uct_dc_mlx5_ep_flush(uct_ep_h tl_ep, unsigned flags, uct_completion_t *comp);
 
 ucs_status_t uct_dc_mlx5_ep_fc_ctrl(uct_ep_t *tl_ep, unsigned op,
-                                    uct_rc_fc_request_t *req);
+                                    uct_rc_pending_req_t *req);
 
 ucs_arbiter_cb_result_t
 uct_dc_mlx5_iface_dci_do_pending_wait(ucs_arbiter_t *arbiter,
@@ -249,21 +256,11 @@ static UCS_F_ALWAYS_INLINE void
 uct_dc_mlx5_ep_clear_fc_grant_flag(uct_dc_mlx5_iface_t *iface,
                                    uct_dc_mlx5_ep_t *ep)
 {
-    ucs_assert((ep->fc.flags & UCT_DC_MLX5_EP_FC_FLAG_WAIT_FOR_GRANT) &&
+    ucs_assert((ep->flags & UCT_DC_MLX5_EP_FLAG_FC_WAIT_FOR_GRANT) &&
                iface->tx.fc_grants);
-    ep->fc.flags &= ~UCT_DC_MLX5_EP_FC_FLAG_WAIT_FOR_GRANT;
+    ep->flags &= ~UCT_DC_MLX5_EP_FLAG_FC_WAIT_FOR_GRANT;
     --iface->tx.fc_grants;
 }
-
-enum uct_dc_mlx5_ep_flags {
-    UCT_DC_MLX5_EP_FLAG_TX_WAIT  = UCS_BIT(0), /* ep is in the tx_wait state. See
-                                                  description of the dcs+quota dci
-                                                  selection policy above */
-    UCT_DC_MLX5_EP_FLAG_GRH      = UCS_BIT(1), /* ep has GRH address. Used by
-                                                  dc_mlx5 endpoint */
-    UCT_DC_MLX5_EP_FLAG_VALID    = UCS_BIT(2)  /* ep is a valid endpoint */
-};
-
 
 void uct_dc_mlx5_ep_handle_failure(uct_dc_mlx5_ep_t *ep, void *arg,
                                    ucs_status_t status);
@@ -500,7 +497,7 @@ out_no_res:
 
 static UCS_F_ALWAYS_INLINE int uct_dc_mlx5_ep_fc_wait_for_grant(uct_dc_mlx5_ep_t *ep)
 {
-    return ep->fc.flags & UCT_DC_MLX5_EP_FC_FLAG_WAIT_FOR_GRANT;
+    return ep->flags & UCT_DC_MLX5_EP_FLAG_FC_WAIT_FOR_GRANT;
 }
 
 ucs_status_t uct_dc_mlx5_ep_check_fc(uct_dc_mlx5_iface_t *iface, uct_dc_mlx5_ep_t *ep);
@@ -517,7 +514,7 @@ static inline struct mlx5_grh_av *uct_dc_mlx5_ep_get_grh(uct_dc_mlx5_ep_t *ep)
     uct_ib_mlx5_txwq_t UCS_V_UNUSED *_txwq;
 
 
-#define UCT_DC_MLX5_CHECK_RES(_iface, _ep) \
+#define UCT_DC_MLX5_CHECK_DCI_RES(_iface, _ep) \
     { \
         ucs_status_t _status = uct_dc_mlx5_iface_dci_get(_iface, _ep); \
         if (ucs_unlikely(_status != UCS_OK)) { \
@@ -528,6 +525,8 @@ static inline struct mlx5_grh_av *uct_dc_mlx5_ep_get_grh(uct_dc_mlx5_ep_t *ep)
 
 #define UCT_DC_CHECK_RES_PTR(_iface, _ep) \
     { \
+        UCT_RC_CHECK_NUM_RDMA_READ_RET(&(_iface)->super.super, \
+                                       UCS_STATUS_PTR(UCS_ERR_NO_RESOURCE)) \
         ucs_status_t status = uct_dc_mlx5_iface_dci_get(_iface, _ep); \
         if (ucs_unlikely(status != UCS_OK)) { \
             return UCS_STATUS_PTR(status); \
@@ -536,14 +535,16 @@ static inline struct mlx5_grh_av *uct_dc_mlx5_ep_get_grh(uct_dc_mlx5_ep_t *ep)
 
 
 /**
- * All RMA and AMO operations are not allowed if no RDMA_READ credits.
- * Otherwise operations ordering can be broken (which fence operation
- * relies on).
+ * All operations are not allowed if no RDMA_READ credits. Otherwise operations
+ * ordering can be broken. If some AM sends added to the pending queue after
+ * RDMA_READ operation, it may be stuck there until RDMA_READ credits arrive,
+ * therefore need to block even AM sends, until all resources are available.
  */
-#define UCT_DC_MLX5_CHECK_RMA_RES(_iface, _ep) \
+#define UCT_DC_MLX5_CHECK_RES(_iface, _ep) \
     { \
-        UCT_RC_CHECK_NUM_RDMA_READ(&(_iface)->super.super) \
-        UCT_DC_MLX5_CHECK_RES(_iface, _ep) \
+        UCT_RC_CHECK_NUM_RDMA_READ_RET(&(_iface)->super.super, \
+                                       UCS_ERR_NO_RESOURCE) \
+        UCT_DC_MLX5_CHECK_DCI_RES(_iface, _ep) \
     }
 
 
@@ -568,6 +569,10 @@ static inline struct mlx5_grh_av *uct_dc_mlx5_ep_get_grh(uct_dc_mlx5_ep_t *ep)
             } \
         } \
         UCT_DC_MLX5_CHECK_RES(_iface, _ep) \
+        if (!uct_dc_mlx5_iface_is_dci_rand(_iface)) { \
+            uct_rc_iface_check_pending(&(_iface)->super.super, \
+                                       &(_ep)->arb_group); \
+        } \
     }
 
 

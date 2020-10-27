@@ -78,13 +78,17 @@ ucs_config_field_t uct_rc_iface_common_config_table[] = {
    ucs_offsetof(uct_rc_iface_common_config_t, fence_mode),
                 UCS_CONFIG_TYPE_ENUM(uct_rc_fence_mode_values)},
 
-  {"TX_NUM_GET_OPS", "inf",
-   "Maximal number of simultaneous get/RDMA_READ operations.",
-   ucs_offsetof(uct_rc_iface_common_config_t, tx.max_get_ops), UCS_CONFIG_TYPE_UINT},
+  {"TX_NUM_GET_OPS", "",
+   "The configuration parameter replaced by UCX_RC_TX_NUM_GET_BYTES.",
+   UCS_CONFIG_DEPRECATED_FIELD_OFFSET, UCS_CONFIG_TYPE_DEPRECATED},
 
   {"MAX_GET_ZCOPY", "auto",
    "Maximal size of get operation with zcopy protocol.",
    ucs_offsetof(uct_rc_iface_common_config_t, tx.max_get_zcopy), UCS_CONFIG_TYPE_MEMUNITS},
+
+  {"TX_NUM_GET_BYTES", "inf",
+   "Maximal number of bytes simultaneously transferred by get/RDMA_READ operations.",
+   ucs_offsetof(uct_rc_iface_common_config_t, tx.max_get_bytes), UCS_CONFIG_TYPE_MEMUNITS},
 
   {NULL}
 };
@@ -128,7 +132,7 @@ static ucs_stats_class_t uct_rc_iface_stats_class = {
 #endif /* ENABLE_STATS */
 
 
-static ucs_mpool_ops_t uct_rc_fc_pending_mpool_ops = {
+static ucs_mpool_ops_t uct_rc_pending_mpool_ops = {
     .chunk_alloc   = ucs_mpool_chunk_malloc,
     .chunk_release = ucs_mpool_chunk_free,
     .obj_init      = NULL,
@@ -138,7 +142,7 @@ static ucs_mpool_ops_t uct_rc_fc_pending_mpool_ops = {
 static void
 uct_rc_iface_flush_comp_init(ucs_mpool_t *mp, void *obj, void *chunk)
 {
-    uct_rc_iface_t *iface      = ucs_container_of(mp, uct_rc_iface_t, tx.flush_mp);
+    uct_rc_iface_t *iface      = ucs_container_of(mp, uct_rc_iface_t, tx.send_op_mp);
     uct_rc_iface_send_op_t *op = obj;
 
     op->handler = uct_rc_ep_flush_op_completion_handler;
@@ -146,7 +150,7 @@ uct_rc_iface_flush_comp_init(ucs_mpool_t *mp, void *obj, void *chunk)
     op->iface   = iface;
 }
 
-static ucs_mpool_ops_t uct_rc_flush_comp_mpool_ops = {
+static ucs_mpool_ops_t uct_rc_send_op_mpool_ops = {
     .chunk_alloc   = ucs_mpool_chunk_malloc,
     .chunk_release = ucs_mpool_chunk_free,
     .obj_init      = uct_rc_iface_flush_comp_init,
@@ -170,7 +174,6 @@ ucs_status_t uct_rc_iface_query(uct_rc_iface_t *iface,
     }
 
     iface_attr->iface_addr_len  = 0;
-    iface_attr->ep_addr_len     = sizeof(uct_rc_ep_address_t);
     iface_attr->max_conn_priv   = 0;
     iface_attr->cap.flags       = UCT_IFACE_FLAG_AM_BCOPY        |
                                   UCT_IFACE_FLAG_AM_ZCOPY        |
@@ -345,13 +348,18 @@ ucs_status_t uct_rc_iface_fc_handler(uct_rc_iface_t *iface, unsigned qp_num,
 {
     ucs_status_t status;
     int16_t      cur_wnd;
-    uct_rc_fc_request_t *fc_req;
+    uct_rc_pending_req_t *fc_req;
     uct_rc_ep_t  *ep  = uct_rc_iface_lookup_ep(iface, qp_num);
     uint8_t fc_hdr    = uct_rc_fc_get_fc_hdr(hdr->am_id);
 
     ucs_assert(iface->config.fc_enabled);
 
-    if (fc_hdr & UCT_RC_EP_FC_FLAG_GRANT) {
+    if (ep == NULL) {
+        /* We get fc for ep which is being removed so should ignore it */
+        goto out;
+    }
+
+    if (fc_hdr & UCT_RC_EP_FLAG_FC_GRANT) {
         UCS_STATS_UPDATE_COUNTER(ep->fc.stats, UCT_RC_FC_STAT_RX_GRANT, 1);
 
         /* Got either grant flag or special FC grant message */
@@ -377,16 +385,16 @@ ucs_status_t uct_rc_iface_fc_handler(uct_rc_iface_t *iface, unsigned qp_num,
         }
     }
 
-    if (fc_hdr & UCT_RC_EP_FC_FLAG_SOFT_REQ) {
+    if (fc_hdr & UCT_RC_EP_FLAG_FC_SOFT_REQ) {
         UCS_STATS_UPDATE_COUNTER(ep->fc.stats, UCT_RC_FC_STAT_RX_SOFT_REQ, 1);
 
         /* Got soft credit request. Mark ep that it needs to grant
          * credits to the peer in outgoing AM (if any). */
-        ep->fc.flags |= UCT_RC_EP_FC_FLAG_GRANT;
+        ep->flags |= UCT_RC_EP_FLAG_FC_GRANT;
 
-    } else if (fc_hdr & UCT_RC_EP_FC_FLAG_HARD_REQ) {
+    } else if (fc_hdr & UCT_RC_EP_FLAG_FC_HARD_REQ) {
         UCS_STATS_UPDATE_COUNTER(ep->fc.stats, UCT_RC_FC_STAT_RX_HARD_REQ, 1);
-        fc_req = ucs_mpool_get(&iface->tx.fc_mp);
+        fc_req = ucs_mpool_get(&iface->tx.pending_mp);
         if (ucs_unlikely(fc_req == NULL)) {
             ucs_error("Failed to allocate FC request. "
                       "Grant will not be sent on ep %p", ep);
@@ -410,6 +418,7 @@ ucs_status_t uct_rc_iface_fc_handler(uct_rc_iface_t *iface, unsigned qp_num,
         }
     }
 
+out:
     return uct_iface_invoke_am(&iface->super.super,
                                (hdr->am_id & ~UCT_RC_EP_FC_MASK),
                                hdr + 1, length, flags);
@@ -438,9 +447,9 @@ static ucs_status_t uct_rc_iface_tx_ops_init(uct_rc_iface_t *iface)
     /* Create memory pool for flush completions. Can't just alloc a certain
      * size buffer, because number of simultaneous flushes is not limited by
      * CQ or QP resources. */
-    status = ucs_mpool_init(&iface->tx.flush_mp, 0, sizeof(*op), 0,
+    status = ucs_mpool_init(&iface->tx.send_op_mp, 0, sizeof(*op), 0,
                             UCS_SYS_CACHE_LINE_SIZE, 256,
-                            UINT_MAX, &uct_rc_flush_comp_mpool_ops,
+                            UINT_MAX, &uct_rc_send_op_mpool_ops,
                             "flush-comps-only");
 
     return status;
@@ -463,7 +472,7 @@ static void uct_rc_iface_tx_ops_cleanup(uct_rc_iface_t *iface)
     }
     ucs_free(iface->tx.ops_buffer);
 
-    ucs_mpool_cleanup(&iface->tx.flush_mp, 1);
+    ucs_mpool_cleanup(&iface->tx.send_op_mp, 1);
 }
 
 unsigned uct_rc_iface_do_progress(uct_iface_h tl_iface)
@@ -520,7 +529,6 @@ UCS_CLASS_INIT_FUNC(uct_rc_iface_t, uct_rc_iface_ops_t *ops, uct_md_h md,
                               &config->super, init_attr);
 
     self->tx.cq_available           = init_attr->cq_len[UCT_IB_DIR_TX] - 1;
-    self->tx.reads_available        = config->tx.max_get_ops;
     self->rx.srq.available          = 0;
     self->rx.srq.quota              = 0;
     self->config.tx_qp_len          = config->super.tx.queue_len;
@@ -541,6 +549,7 @@ UCS_CLASS_INIT_FUNC(uct_rc_iface_t, uct_rc_iface_ops_t *ops, uct_md_h md,
     self->config.ooo_rw             = config->ooo_rw;
 #if UCS_ENABLE_ASSERT
     self->config.tx_cq_len          = init_attr->cq_len[UCT_IB_DIR_TX];
+    self->tx.in_pending             = 0;
 #endif
     max_ib_msg_size                 = uct_ib_iface_port_attr(&self->super)->max_msg_sz;
 
@@ -555,10 +564,20 @@ UCS_CLASS_INIT_FUNC(uct_rc_iface_t, uct_rc_iface_ops_t *ops, uct_md_h md,
         self->config.max_get_zcopy = max_ib_msg_size;
     }
 
+    if ((config->tx.max_get_bytes == UCS_MEMUNITS_INF) ||
+        (config->tx.max_get_bytes == UCS_MEMUNITS_AUTO)) {
+        self->tx.reads_available = SSIZE_MAX;
+    } else {
+        self->tx.reads_available = config->tx.max_get_bytes;
+    }
+
+    self->tx.reads_completed = 0;
+
     uct_ib_fence_info_init(&self->tx.fi);
     memset(self->eps, 0, sizeof(self->eps));
     ucs_arbiter_init(&self->tx.arbiter);
     ucs_list_head_init(&self->ep_list);
+    ucs_list_head_init(&self->ep_gc_list);
 
     /* Check FC parameters correctness */
     if ((config->fc.hard_thresh <= 0) || (config->fc.hard_thresh >= 1)) {
@@ -618,8 +637,16 @@ UCS_CLASS_INIT_FUNC(uct_rc_iface_t, uct_rc_iface_ops_t *ops, uct_md_h md,
         goto err_destroy_stats;
     }
 
-    self->config.fc_enabled      = config->fc.enable;
+    /* Create mempool for pending requests */
+    ucs_assert(init_attr->fc_req_size >= sizeof(uct_rc_pending_req_t));
+    status = ucs_mpool_init(&self->tx.pending_mp, 0, init_attr->fc_req_size,
+                            0, 1, 128, UINT_MAX, &uct_rc_pending_mpool_ops,
+                            "pending-ops");
+    if (status != UCS_OK) {
+        goto err_cleanup_rx;
+    }
 
+    self->config.fc_enabled = config->fc.enable;
     if (self->config.fc_enabled) {
         /* Assume that number of recv buffers is the same on all peers.
          * Then FC window size is the same for all endpoints as well.
@@ -629,20 +656,6 @@ UCS_CLASS_INIT_FUNC(uct_rc_iface_t, uct_rc_iface_ops_t *ops, uct_md_h md,
                                                config->super.rx.queue_len);
         self->config.fc_hard_thresh  = ucs_max((int)(self->config.fc_wnd_size *
                                                config->fc.hard_thresh), 1);
-
-        /* Create mempool for pending requests for FC grant */
-        status = ucs_mpool_init(&self->tx.fc_mp,
-                                0,
-                                init_attr->fc_req_size,
-                                0,
-                                1,
-                                128,
-                                UINT_MAX,
-                                &uct_rc_fc_pending_mpool_ops,
-                                "pending-fc-grants-only");
-        if (status != UCS_OK) {
-            goto err_cleanup_rx;
-        }
     } else {
         self->config.fc_wnd_size     = INT16_MAX;
         self->config.fc_hard_thresh  = 0;
@@ -662,6 +675,18 @@ err_destroy_rx_mp:
     ucs_mpool_cleanup(&self->rx.mp, 1);
 err:
     return status;
+}
+
+void uct_rc_iface_cleanup_eps(uct_rc_iface_t *iface)
+{
+    uct_rc_iface_ops_t *ops = ucs_derived_of(iface->super.ops, uct_rc_iface_ops_t);
+    uct_rc_ep_cleanup_ctx_t *cleanup_ctx, *tmp;
+
+    ucs_list_for_each_safe(cleanup_ctx, tmp, &iface->ep_gc_list, list) {
+        ops->cleanup_qp(&cleanup_ctx->super);
+    }
+
+    ucs_assert(ucs_list_is_empty(&iface->ep_gc_list));
 }
 
 static UCS_CLASS_CLEANUP_FUNC(uct_rc_iface_t)
@@ -686,9 +711,7 @@ static UCS_CLASS_CLEANUP_FUNC(uct_rc_iface_t)
     uct_rc_iface_tx_ops_cleanup(self);
     ucs_mpool_cleanup(&self->tx.mp, 1);
     ucs_mpool_cleanup(&self->rx.mp, 0); /* Cannot flush SRQ */
-    if (self->config.fc_enabled) {
-        ucs_mpool_cleanup(&self->tx.fc_mp, 1);
-    }
+    ucs_mpool_cleanup(&self->tx.pending_mp, 1);
 }
 
 UCS_CLASS_DEFINE(uct_rc_iface_t, uct_ib_iface_t);
@@ -885,4 +908,3 @@ ucs_status_t uct_rc_iface_fence(uct_iface_h tl_iface, unsigned flags)
     UCT_TL_IFACE_STAT_FENCE(&iface->super.super);
     return UCS_OK;
 }
-

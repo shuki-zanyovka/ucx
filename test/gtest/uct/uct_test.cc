@@ -12,7 +12,9 @@
 #include <ucs/sys/string.h>
 #include <common/test_helpers.h>
 #include <algorithm>
+#ifdef HAVE_MALLOC_H
 #include <malloc.h>
+#endif
 #include <ifaddrs.h>
 
 
@@ -497,13 +499,13 @@ bool uct_test::check_atomics(uint64_t required_ops, atomic_mode mode) {
 
 /* modify the config of all the matching environment parameters */
 void uct_test::modify_config(const std::string& name, const std::string& value,
-                             bool optional) {
+                             modify_config_mode_t mode) {
     ucs_status_t status = UCS_OK;
 
     if (m_cm_config != NULL) {
         status = uct_config_modify(m_cm_config, name.c_str(), value.c_str());
         if (status == UCS_OK) {
-            optional = true;
+            mode = IGNORE_IF_NOT_EXIST;
         } else if (status != UCS_ERR_NO_ELEM) {
             UCS_TEST_ABORT("Couldn't modify cm config parameter: " << name.c_str() <<
                            " to " << value.c_str() << ": " << ucs_status_string(status));
@@ -513,7 +515,7 @@ void uct_test::modify_config(const std::string& name, const std::string& value,
     if (m_iface_config != NULL) {
         status = uct_config_modify(m_iface_config, name.c_str(), value.c_str());
         if (status == UCS_OK) {
-            optional = true;
+            mode = IGNORE_IF_NOT_EXIST;
         } else if (status != UCS_ERR_NO_ELEM) {
             UCS_TEST_ABORT("Couldn't modify iface config parameter: " << name.c_str() <<
                            " to " << value.c_str() << ": " << ucs_status_string(status));
@@ -522,10 +524,10 @@ void uct_test::modify_config(const std::string& name, const std::string& value,
 
     status = uct_config_modify(m_md_config, name.c_str(), value.c_str());
     if (status == UCS_OK) {
-        optional = true;
+        mode = IGNORE_IF_NOT_EXIST;
     }
     if ((status == UCS_OK) || (status == UCS_ERR_NO_ELEM)) {
-        test_base::modify_config(name, value, optional);
+        test_base::modify_config(name, value, mode);
     } else if (status != UCS_OK) {
         UCS_TEST_ABORT("Couldn't modify md config parameter: " << name.c_str() <<
                        " to " << value.c_str() << ": " << ucs_status_string(status));
@@ -582,6 +584,16 @@ bool uct_test::has_rc_or_dc() const {
 
 bool uct_test::has_ib() const {
     return (has_rc_or_dc() || has_ud());
+}
+
+bool uct_test::has_mm() const {
+    return (has_transport("posix") ||
+            has_transport("sysv") ||
+            has_transport("xpmem"));
+}
+
+bool uct_test::has_cma() const {
+    return has_transport("cma");
 }
 
 void uct_test::stats_activate()
@@ -844,7 +856,18 @@ uct_test::entity::entity(const resource& resource, uct_md_config_t *md_config,
 void uct_test::entity::mem_alloc_host(size_t length,
                                       uct_allocated_memory_t *mem) const {
 
+    void *address = NULL;
     ucs_status_t status;
+    uct_mem_alloc_params_t params;
+
+    params.field_mask      = UCT_MEM_ALLOC_PARAM_FIELD_FLAGS     |
+                             UCT_MEM_ALLOC_PARAM_FIELD_ADDRESS   |
+                             UCT_MEM_ALLOC_PARAM_FIELD_MEM_TYPE  |
+                             UCT_MEM_ALLOC_PARAM_FIELD_NAME;
+    params.flags           = UCT_MD_MEM_ACCESS_ALL;
+    params.name            = "uct_test";
+    params.mem_type        = UCS_MEMORY_TYPE_HOST;
+    params.address         = address;
 
     if (md_attr().cap.flags & (UCT_MD_FLAG_ALLOC|UCT_MD_FLAG_REG)) {
         status = uct_iface_mem_alloc(m_iface, length, UCT_MD_MEM_ACCESS_ALL,
@@ -852,8 +875,7 @@ void uct_test::entity::mem_alloc_host(size_t length,
         ASSERT_UCS_OK(status);
     } else {
         uct_alloc_method_t method = UCT_ALLOC_METHOD_MMAP;
-        status = uct_mem_alloc(NULL, length, UCT_MD_MEM_ACCESS_ALL, &method, 1,
-                               NULL, 0, "uct_test", mem);
+        status = uct_mem_alloc(length, &method, 1, &params, mem);
         ASSERT_UCS_OK(status);
         ucs_assert(mem->memh == UCT_MEM_HANDLE_NULL);
     }
@@ -1436,7 +1458,7 @@ void uct_test::async_event_ctx::signal() {
     ucs_async_pipe_push(&aux_pipe);
 }
 
-bool uct_test::async_event_ctx::wait_for_event(entity &e, int timeout) {
+bool uct_test::async_event_ctx::wait_for_event(entity &e, double timeout_sec) {
     if (wakeup_fd.fd == -1) {
         /* create wakeup */
         if (e.iface_attr().cap.event_flags & UCT_IFACE_FLAG_EVENT_FD) {
@@ -1452,11 +1474,12 @@ bool uct_test::async_event_ctx::wait_for_event(entity &e, int timeout) {
         }
     }
 
-    int ret = poll(&wakeup_fd, 1, timeout);
+    int timeout_ms = static_cast<int>((timeout_sec * UCS_MSEC_PER_SEC) *
+                                      ucs::test_time_multiplier());
+    int ret        = poll(&wakeup_fd, 1, timeout_ms);
     EXPECT_TRUE((ret == 0) || (ret == 1));
     if (ret > 0) {
-        if (e.iface_attr().cap.event_flags &
-            UCT_IFACE_FLAG_EVENT_ASYNC_CB) {
+        if (e.iface_attr().cap.event_flags & UCT_IFACE_FLAG_EVENT_ASYNC_CB) {
             ucs_async_pipe_drain(&aux_pipe);
         }
         return true;

@@ -86,7 +86,7 @@ static ucs_status_t uct_sockcm_iface_notify_client(int notif_val,
     
     fd = ((uct_sockcm_ctx_t *) conn_request)->sock_fd;
 
-    return ucs_socket_send(fd, &notif, sizeof(notif), NULL, NULL);
+    return ucs_socket_send(fd, &notif, sizeof(notif));
 }
 
 static ucs_status_t uct_sockcm_iface_accept(uct_iface_h tl_iface,
@@ -157,7 +157,8 @@ static ucs_status_t uct_sockcm_iface_process_conn_req(uct_sockcm_ctx_t *sock_id_
     return UCS_OK;
 }
 
-static void uct_sockcm_iface_recv_handler(int fd, int events, void *arg)
+static void uct_sockcm_iface_recv_handler(int fd, ucs_event_set_types_t events,
+                                          void *arg)
 {
     uct_sockcm_ctx_t *sock_id_ctx = (uct_sockcm_ctx_t *) arg;
     ucs_status_t status;
@@ -172,7 +173,7 @@ static void uct_sockcm_iface_recv_handler(int fd, int events, void *arg)
     status = ucs_socket_recv_nb(sock_id_ctx->sock_fd,
                                 UCS_PTR_BYTE_OFFSET(&sock_id_ctx->conn_param,
                                                     sock_id_ctx->recv_len),
-                                &recv_len, NULL, NULL);
+                                &recv_len);
     if ((status == UCS_ERR_CANCELED) || (status == UCS_ERR_IO_ERROR)) {
         ucs_warn("recv failed in recv handler");
         /* TODO: clean up resources allocated for client endpoint? */
@@ -196,7 +197,8 @@ out_remove_handler:
     }
 }
 
-static void uct_sockcm_iface_event_handler(int fd, int events, void *arg)
+static void uct_sockcm_iface_event_handler(int fd, ucs_event_set_types_t events,
+                                           void *arg)
 {
     size_t recv_len               = 0;
     uct_sockcm_iface_t *iface     = arg;
@@ -247,8 +249,7 @@ static void uct_sockcm_iface_event_handler(int fd, int events, void *arg)
 
     recv_len = sizeof(sock_id_ctx->conn_param);
 
-    status = ucs_socket_recv_nb(accept_fd, &sock_id_ctx->conn_param, &recv_len,
-                                NULL, NULL);
+    status = ucs_socket_recv_nb(accept_fd, &sock_id_ctx->conn_param, &recv_len);
     if (UCS_OK != status) {
         sock_id_ctx->recv_len = ((UCS_ERR_NO_PROGRESS == status) ? 0: recv_len);
         status = ucs_async_set_event_handler(iface->super.worker->async->mode,
@@ -296,7 +297,7 @@ static UCS_CLASS_INIT_FUNC(uct_sockcm_iface_t, uct_md_h md, uct_worker_h worker,
 
     UCT_CHECK_PARAM((params->open_mode & UCT_IFACE_OPEN_MODE_SOCKADDR_SERVER) ||
                     (params->open_mode & UCT_IFACE_OPEN_MODE_SOCKADDR_CLIENT),
-                    "Invalid open mode %zu", params->open_mode);
+                    "Invalid open mode %"PRIu64, params->open_mode);
 
     UCT_CHECK_PARAM(!(params->open_mode & UCT_IFACE_OPEN_MODE_SOCKADDR_SERVER) ||
                     (params->field_mask & UCT_IFACE_PARAM_FIELD_SOCKADDR),

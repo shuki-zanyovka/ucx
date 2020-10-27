@@ -5,7 +5,6 @@
 * See file LICENSE for terms.
 */
 
-
 #ifndef UCS_COMPILER_DEF_H
 #define UCS_COMPILER_DEF_H
 
@@ -108,22 +107,15 @@
  * Size of statically-declared array
  */
 #define ucs_static_array_size(_array) \
-    ({ \
-        UCS_STATIC_ASSERT((void*)&(_array) == (void*)&((_array)[0])); \
-        ( sizeof(_array) / sizeof((_array)[0]) ); \
-    })
-
-/**
- * @return count of elements in const-size array
- */
-#define ucs_array_size(_array) \
     (sizeof(_array) / sizeof((_array)[0]))
+
 
 /**
  * @return Offset of _member in _type. _type is a structure type.
  */
 #define ucs_offsetof(_type, _member) \
     ((unsigned long)&( ((_type*)0)->_member ))
+
 
 /**
  * Get a pointer to a struct containing a member.

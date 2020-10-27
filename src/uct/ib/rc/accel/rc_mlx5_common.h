@@ -120,17 +120,6 @@ enum {
     UCT_RC_MLX5_OPCODE_TAG_MATCHING          = 0x28,
     UCT_RC_MLX5_CQE_APP_TAG_MATCHING         = 1,
 
-    /* last packet flag for multi-packet RQs */
-    UCT_RC_MLX5_MP_RQ_LAST_MSG_FIELD         = 0x40000000,
-
-    /* byte count mask for multi-packet RQs */
-    UCT_RC_MLX5_MP_RQ_BYTE_CNT_FIELD_MASK    = 0x0000FFFF,
-
-    UCT_RC_MLX5_MP_RQ_NUM_STRIDES_FIELD_MASK = 0x3FFF0000,
-
-    /* filler cqe indicator */
-    UCT_RC_MLX5_MP_RQ_FILLER_CQE             = UCS_BIT(31),
-
     /* tag segment flags */
     UCT_RC_MLX5_SRQ_FLAG_TM_SW_CNT           = (1 << 6),
     UCT_RC_MLX5_SRQ_FLAG_TM_CQE_REQ          = (1 << 7),
@@ -582,8 +571,8 @@ uct_rc_mlx5_ctx_priv(uct_tag_context_t *ctx)
 static UCS_F_ALWAYS_INLINE void
 uct_rc_mlx5_handle_rndv_fin(uct_rc_mlx5_iface_common_t *iface, uint32_t app_ctx)
 {
+    void *rndv_comp = NULL;
     int found;
-    void *rndv_comp;
 
     found = ucs_ptr_array_lookup(&iface->tm.rndv_comps, app_ctx, rndv_comp);
     ucs_assert_always(found > 0);
@@ -619,6 +608,16 @@ void uct_rc_mlx5_iface_common_update_cqs_ci(uct_rc_mlx5_iface_common_t *iface,
 
 void uct_rc_mlx5_iface_common_sync_cqs_ci(uct_rc_mlx5_iface_common_t *iface,
                                           uct_ib_iface_t *ib_iface);
+
+void uct_rc_mlx5_iface_common_check_cqs_ci(uct_rc_mlx5_iface_common_t *iface,
+                                           uct_ib_iface_t *ib_iface);
+
+ucs_status_t
+uct_rc_mlx5_iface_common_arm_cq(uct_ib_iface_t *ib_iface, uct_ib_dir_t dir,
+                                int solicited_only);
+
+void uct_rc_mlx5_iface_common_event_cq(uct_ib_iface_t *ib_iface,
+                                       uct_ib_dir_t dir);
 
 int uct_rc_mlx5_iface_commom_clean(uct_ib_mlx5_cq_t *mlx5_cq,
                                    uct_ib_mlx5_srq_t *srq, uint32_t qpn);
@@ -668,7 +667,7 @@ uct_rc_mlx5_devx_init_rx_tm(uct_rc_mlx5_iface_common_t *iface,
 ucs_status_t uct_rc_mlx5_devx_init_rx(uct_rc_mlx5_iface_common_t *iface,
                                       const uct_rc_iface_common_config_t *config);
 
-void uct_rc_mlx5_devx_cleanup_srq(uct_ib_mlx5_srq_t *srq);
+void uct_rc_mlx5_devx_cleanup_srq(uct_ib_mlx5_md_t *md, uct_ib_mlx5_srq_t *srq);
 #else
 static UCS_F_MAYBE_UNUSED ucs_status_t
 uct_rc_mlx5_devx_init_rx(uct_rc_mlx5_iface_common_t *iface,
@@ -678,7 +677,7 @@ uct_rc_mlx5_devx_init_rx(uct_rc_mlx5_iface_common_t *iface,
 }
 
 static UCS_F_MAYBE_UNUSED void
-uct_rc_mlx5_devx_cleanup_srq(uct_ib_mlx5_srq_t *srq)
+uct_rc_mlx5_devx_cleanup_srq(uct_ib_mlx5_md_t *md, uct_ib_mlx5_srq_t *srq)
 {
     ucs_bug("DevX SRQ cleanup has to be done only if DevX support is enabled");
 }
@@ -704,6 +703,13 @@ uct_rc_mlx5_am_hdr_fill(uct_rc_mlx5_hdr_t *rch, uint8_t id)
 #endif
     rch->rc_hdr.am_id = id;
 }
+
+#if HAVE_DECL_MLX5DV_CREATE_QP
+void uct_rc_mlx5_common_fill_dv_qp_attr(uct_rc_mlx5_iface_common_t *iface,
+                                        struct ibv_qp_init_attr_ex *qp_attr,
+                                        struct mlx5dv_qp_init_attr *dv_attr,
+                                        unsigned scat2cqe_dir_mask);
+#endif
 
 #if HAVE_DEVX
 ucs_status_t
@@ -744,6 +750,6 @@ ucs_status_t
 uct_rc_mlx5_common_iface_init_rx(uct_rc_mlx5_iface_common_t *iface,
                                  const uct_rc_iface_common_config_t *rc_config);
 
-void uct_rc_mlx5_destroy_srq(uct_ib_mlx5_srq_t *srq);
+void uct_rc_mlx5_destroy_srq(uct_ib_mlx5_md_t *md, uct_ib_mlx5_srq_t *srq);
 
 #endif

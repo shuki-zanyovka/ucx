@@ -154,6 +154,24 @@ void uct_iface_mpool_empty_warn(uct_base_iface_t *iface, ucs_mpool_t *mp)
     }
 }
 
+void uct_iface_set_async_event_params(const uct_iface_params_t *params,
+                                      uct_async_event_cb_t *event_cb,
+                                      void **event_arg)
+{
+    if (params->field_mask & UCT_IFACE_PARAM_FIELD_ASYNC_EVENT_CB) {
+        *event_cb = params->async_event_cb;
+    } else {
+        *event_cb = NULL;
+    }
+
+    if (params->field_mask & UCT_IFACE_PARAM_FIELD_ASYNC_EVENT_ARG) {
+        *event_arg = params->async_event_arg;
+    } else {
+        *event_arg = NULL;
+    }
+}
+
+
 ucs_status_t uct_iface_query(uct_iface_h iface, uct_iface_attr_t *iface_attr)
 {
     return iface->ops.iface_query(iface, iface_attr);
@@ -411,7 +429,8 @@ ucs_status_t uct_single_device_resource(uct_md_h md, const char *dev_name,
     }
 
     ucs_snprintf_zero(device->name, sizeof(device->name), "%s", dev_name);
-    device->type = dev_type;
+    device->type       = dev_type;
+    device->sys_device = UCS_SYS_DEVICE_ID_UNKNOWN;
 
     *num_tl_devices_p = 1;
     *tl_devices_p     = device;
@@ -574,7 +593,6 @@ UCS_CLASS_CLEANUP_FUNC(uct_ep_t)
 
 UCS_CLASS_DEFINE(uct_ep_t, void);
 
-
 UCS_CLASS_INIT_FUNC(uct_base_ep_t, uct_base_iface_t *iface)
 {
     UCS_CLASS_CALL_SUPER_INIT(uct_ep_t, &iface->super);
@@ -609,7 +627,7 @@ ucs_config_field_t uct_iface_config_table[] = {
    "Priority of methods to allocate intermediate buffers for communication",
    ucs_offsetof(uct_iface_config_t, alloc_methods), UCS_CONFIG_TYPE_ARRAY(alloc_methods)},
 
-  {"FAILURE", "error",
+  {"FAILURE", "diag",
    "Level of network failure reporting",
    ucs_offsetof(uct_iface_config_t, failure), UCS_CONFIG_TYPE_ENUM(ucs_log_level_names)},
 

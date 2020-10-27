@@ -19,7 +19,7 @@
  */
 class mem_buffer {
 public:
-    static std::vector<ucs_memory_type_t> supported_mem_types();
+    static const std::vector<ucs_memory_type_t>& supported_mem_types();
 
     /* allocate buffer of a given memory type */
     static void *allocate(size_t size, ucs_memory_type_t mem_type);
@@ -56,6 +56,11 @@ public:
     static bool compare(const void *expected, const void *buffer,
                         size_t length, ucs_memory_type_t mem_type);
 
+    /* compare when both expected data and buffer can be different mem types */
+    static bool compare(const void *expected, const void *buffer,
+                        size_t length, ucs_memory_type_t mem_type_expected,
+                        ucs_memory_type_t mem_type_buffer);
+
     /* return the string name of a memory type */
     static std::string mem_type_name(ucs_memory_type_t mem_type);
 
@@ -70,6 +75,10 @@ public:
 
 private:
     static void abort_wrong_mem_type(ucs_memory_type_t mem_type);
+
+    static bool is_cuda_supported();
+
+    static bool is_rocm_supported();
 
     static uint64_t pat(uint64_t prev);
 

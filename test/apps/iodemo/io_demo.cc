@@ -21,8 +21,7 @@
 #include <algorithm>
 #include <limits>
 
-#define ALIGNMENT 4096
-
+#define ALIGNMENT       4096
 
 /* IO operation type */
 typedef enum {
@@ -39,21 +38,21 @@ static const char *io_op_names[] = {
 
 /* test options */
 typedef struct {
-    const char           *server_addr;
-    int                  port_num;
-    long                 client_retries;
-    double               client_timeout;
-    double               client_runtime_limit;
-    size_t               iomsg_size;
-    size_t               min_data_size;
-    size_t               max_data_size;
-    size_t               chunk_size;
-    long                 iter_count;
-    long                 window_size;
-    std::vector<io_op_t> operations;
-    unsigned             random_seed;
-    size_t               num_buffers;
-    bool                 verbose;
+    std::vector<const char*> servers;
+    int                      port_num;
+    long                     client_retries;
+    double                   client_timeout;
+    double                   client_runtime_limit;
+    size_t                   iomsg_size;
+    size_t                   min_data_size;
+    size_t                   max_data_size;
+    size_t                   chunk_size;
+    long                     iter_count;
+    long                     window_size;
+    std::vector<io_op_t>     operations;
+    unsigned                 random_seed;
+    size_t                   num_buffers;
+    bool                     verbose;
 } options_t;
 
 #define LOG         UcxLog("[DEMO]", true)
@@ -539,12 +538,32 @@ public:
         return (_status == OK);
     }
 
-    UcxConnection* connect() {
+    UcxConnection* connect(const char* server) {
         struct sockaddr_in connect_addr;
+        std::string server_addr;
+        int port_num;
+
         memset(&connect_addr, 0, sizeof(connect_addr));
         connect_addr.sin_family = AF_INET;
-        connect_addr.sin_port   = htons(opts().port_num);
-        inet_pton(AF_INET, opts().server_addr, &connect_addr.sin_addr);
+
+        const char *port_separator = strchr(server, ':');
+        if (port_separator == NULL) {
+            /* take port number from -p argument */
+            port_num    = opts().port_num;
+            server_addr = server;
+        } else {
+            /* take port number from the server parameter */
+            server_addr = std::string(server)
+                            .substr(0, port_separator - server);
+            port_num    = atoi(port_separator + 1);
+        }
+
+        connect_addr.sin_port = htons(port_num);
+        int ret = inet_pton(AF_INET, server_addr.c_str(), &connect_addr.sin_addr);
+        if (ret != 1) {
+            LOG << "invalid address " << server_addr;
+            return NULL;
+        }
 
         return UcxContext::connect((const struct sockaddr*)&connect_addr,
                                    sizeof(connect_addr));
@@ -565,9 +584,19 @@ public:
     }
 
     bool run() {
-        UcxConnection* conn = connect();
-        if (!conn) {
-            return false;
+        std::vector<UcxConnection*> conn;
+        conn.resize(opts().servers.size());
+        for (size_t i = 0; i < conn.size(); i++) {
+            conn[i] = connect(opts().servers[i]);
+            if (!conn[i]) {
+                LOG << "Connect to server ["
+                    << opts().servers[i]
+                    << "] Failed!";
+                for (size_t j = 0; j < i; j++) {
+                    delete conn[j];
+                }
+                return false;
+            }
         }
 
         _status = OK;
@@ -593,14 +622,15 @@ public:
                 break;
             }
 
-            io_op_t op = get_op();
+            size_t conn_num = IoDemoRandom::rand(0, conn.size() - 1);
+            io_op_t op      = get_op();
             size_t size;
             switch (op) {
             case IO_READ:
-                size = do_io_read(conn, total_iter);
+                size = do_io_read(conn[conn_num], total_iter);
                 break;
             case IO_WRITE:
-                size = do_io_write(conn, total_iter);
+                size = do_io_write(conn[conn_num], total_iter);
                 break;
             default:
                 abort();
@@ -636,12 +666,21 @@ public:
             check_time_limit(curr_time);
         }
 
-        delete conn;
+        for (size_t i = 0; i < conn.size(); i++) {
+            delete conn[i];
+        }
         return (_status == OK) || (_status == RUNTIME_EXCEEDED);
     }
 
-    // returns true if number of connection retries is exceeded
+    // returns true if has to stop the connection retries
     bool update_retry() {
+        _status = OK;
+        check_time_limit(get_time());
+        if (_status == RUNTIME_EXCEEDED) {
+            /* the run-time of the application has been exhausted */
+            return true;
+        }
+
         if (++_retry >= opts().client_retries) {
             /* client failed all retries */
             _status = CONN_RETRIES_EXCEEDED;
@@ -816,7 +855,6 @@ static int parse_args(int argc, char **argv, options_t *test_opts)
     bool found;
     int c;
 
-    test_opts->server_addr          = NULL;
     test_opts->port_num             = 1337;
     test_opts->client_retries       = std::numeric_limits<long>::max();
     test_opts->client_timeout       = 1.0;
@@ -860,6 +898,9 @@ static int parse_args(int argc, char **argv, options_t *test_opts)
             break;
         case 'i':
             test_opts->iter_count = strtol(optarg, NULL, 0);
+            if (test_opts->iter_count == 0) {
+                test_opts->iter_count = std::numeric_limits<long int>::max();
+            }
             break;
         case 'w':
             test_opts->window_size = atoi(optarg);
@@ -918,6 +959,7 @@ static int parse_args(int argc, char **argv, options_t *test_opts)
         case 'h':
         default:
             std::cout << "Usage: io_demo [options] [server_address]" << std::endl;
+            std::cout << "       or io_demo [options] [server_address0:port0] [server_address1:port1]..." << std::endl;
             std::cout << "" << std::endl;
             std::cout << "Supported options are:" << std::endl;
             std::cout << "  -p <port>                  TCP port number to use" << std::endl;
@@ -943,8 +985,8 @@ static int parse_args(int argc, char **argv, options_t *test_opts)
         }
     }
 
-    if (optind < argc) {
-        test_opts->server_addr = argv[optind];
+    while (optind < argc) {
+        test_opts->servers.push_back(argv[optind++]);
     }
 
     if (test_opts->operations.size() == 0) {
@@ -1002,7 +1044,7 @@ int main(int argc, char **argv)
         return ret;
     }
 
-    if (test_opts.server_addr == NULL) {
+    if (test_opts.servers.empty()) {
         return do_server(test_opts);
     } else {
         return do_client(test_opts);

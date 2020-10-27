@@ -8,7 +8,7 @@
 #  include "config.h"
 #endif
 
-#include "ucp_mm.h"
+#include "ucp_rkey.h"
 #include "ucp_request.h"
 #include "ucp_ep.inl"
 
@@ -120,7 +120,7 @@ ucs_status_t ucp_rkey_pack(ucp_context_h context, ucp_mem_h memh,
     /* always acquire context lock */
     UCP_THREAD_CS_ENTER(&context->mt_lock);
 
-    ucs_trace("packing rkeys for buffer %p memh %p md_map 0x%lx",
+    ucs_trace("packing rkeys for buffer %p memh %p md_map 0x%"PRIx64,
               memh->address, memh, memh->md_map);
 
     if (memh->length == 0) {
@@ -176,6 +176,7 @@ UCS_PROFILE_FUNC(ucs_status_t, ucp_ep_rkey_unpack, (ep, rkey_buffer, rkey_p),
 {
     ucp_worker_h  worker = ep->worker;
     const ucp_ep_config_t *ep_config;
+    ucp_rkey_config_key_t rkey_config_key;
     unsigned remote_md_index;
     ucp_md_map_t md_map, remote_md_map;
     ucp_rsc_index_t cmpt_index;
@@ -198,7 +199,7 @@ UCS_PROFILE_FUNC(ucs_status_t, ucp_ep_rkey_unpack, (ep, rkey_buffer, rkey_p),
 
     /* Read remote MD map */
     remote_md_map = *(ucp_md_map_t*)p;
-    ucs_trace("ep %p: unpacking rkey with md_map 0x%lx", ep, remote_md_map);
+    ucs_trace("ep %p: unpacking rkey with md_map 0x%"PRIx64, ep, remote_md_map);
 
     /* MD map for the unpacked rkey */
     md_map   = remote_md_map & ucp_ep_config(ep)->key.reachable_md_map;
@@ -280,7 +281,27 @@ UCS_PROFILE_FUNC(ucs_status_t, ucp_ep_rkey_unpack, (ep, rkey_buffer, rkey_p),
      */
     ucs_assert((rkey_index > 0) || (rkey->md_map == 0));
 
-    ucp_rkey_resolve_inner(rkey, ep);
+    if (worker->context->config.ext.proto_enable) {
+        rkey_config_key.ep_cfg_index = ep->cfg_index;
+        rkey_config_key.md_map       = rkey->md_map;
+        rkey_config_key.mem_type     = rkey->mem_type;
+        rkey_config_key.sys_dev      = 0;
+
+        status = ucp_worker_get_rkey_config(worker, &rkey_config_key,
+                                            &rkey->cfg_index);
+        if (status != UCS_OK) {
+            goto err_destroy;
+        }
+
+        /* Avoid calling ucp_ep_resolve_remote_id() from rkey_unpack, and let
+         * the APIs which are not yet using new protocols resolve the remote key
+         * on-demand.
+         */
+        rkey->cache.ep_cfg_index = UCP_WORKER_CFG_INDEX_NULL;
+    } else {
+        ucp_rkey_resolve_inner(rkey, ep);
+    }
+
     *rkey_p = rkey;
     status  = UCS_OK;
 
@@ -387,6 +408,7 @@ ucp_lane_index_t ucp_rkey_find_rma_lane(ucp_context_h context,
     ucp_lane_index_t lane;
     ucp_md_index_t md_index;
     uct_md_attr_t *md_attr;
+    uint64_t mem_types;
     uint8_t rkey_index;
     int prio;
 
@@ -405,15 +427,15 @@ ucp_lane_index_t ucp_rkey_find_rma_lane(ucp_context_h context,
             (!(md_attr->cap.flags & UCT_MD_FLAG_NEED_RKEY)))
         {
             /* Lane does not need rkey, can use the lane with invalid rkey  */
-            if (!rkey || ((mem_type == md_attr->cap.access_mem_type) &&
+            if (!rkey || ((md_attr->cap.access_mem_types & UCS_BIT(mem_type)) &&
                           (mem_type == rkey->mem_type))) {
                 *uct_rkey_p = UCT_INVALID_RKEY;
                 return lane;
             }
         }
 
-        if ((md_index != UCP_NULL_RESOURCE) &&
-            (!(md_attr->cap.reg_mem_types & UCS_BIT(mem_type)))) {
+        mem_types = md_attr->cap.reg_mem_types | md_attr->cap.alloc_mem_types;
+        if ((md_index != UCP_NULL_RESOURCE) && !(mem_types & UCS_BIT(mem_type))) {
             continue;
         }
 
@@ -433,19 +455,20 @@ void ucp_rkey_resolve_inner(ucp_rkey_h rkey, ucp_ep_h ep)
 {
     ucp_context_h context   = ep->worker->context;
     ucp_ep_config_t *config = ucp_ep_config(ep);
+    int rma_sw              = 0;
+    int amo_sw              = 0;
     ucs_status_t status;
     uct_rkey_t uct_rkey;
-    int rma_sw, amo_sw;
 
     rkey->cache.rma_lane = ucp_rkey_find_rma_lane(context, config,
                                                   UCS_MEMORY_TYPE_HOST,
                                                   config->key.rma_lanes, rkey,
                                                   0, &uct_rkey);
-    rma_sw = (rkey->cache.rma_lane == UCP_NULL_LANE);
-    if (rma_sw) {
+    if (rkey->cache.rma_lane == UCP_NULL_LANE) {
         rkey->cache.rma_proto     = &ucp_rma_sw_proto;
         rkey->cache.rma_rkey      = UCT_INVALID_RKEY;
         rkey->cache.max_put_short = 0;
+        rma_sw                    = !!(context->config.features & UCP_FEATURE_RMA);
     } else {
         rkey->cache.rma_proto     = &ucp_rma_basic_proto;
         rkey->cache.rma_rkey      = uct_rkey;
@@ -457,10 +480,11 @@ void ucp_rkey_resolve_inner(ucp_rkey_h rkey, ucp_ep_h ep)
                                                   UCS_MEMORY_TYPE_HOST,
                                                   config->key.amo_lanes, rkey,
                                                   0, &uct_rkey);
-    amo_sw = (rkey->cache.amo_lane == UCP_NULL_LANE);
-    if (amo_sw) {
+    if (rkey->cache.amo_lane == UCP_NULL_LANE) {
         rkey->cache.amo_proto     = &ucp_amo_sw_proto;
         rkey->cache.amo_rkey      = UCT_INVALID_RKEY;
+        amo_sw                    = !!(context->config.features &
+                                       (UCP_FEATURE_AMO32 | UCP_FEATURE_AMO64));
     } else {
         rkey->cache.amo_proto     = &ucp_amo_basic_proto;
         rkey->cache.amo_rkey      = uct_rkey;
@@ -470,7 +494,7 @@ void ucp_rkey_resolve_inner(ucp_rkey_h rkey, ucp_ep_h ep)
      * receive responses and completion messages
      */
     if ((amo_sw || rma_sw) && (config->key.am_lane != UCP_NULL_LANE)) {
-        status = ucp_ep_resolve_dest_ep_ptr(ep, config->key.am_lane);
+        status = ucp_ep_resolve_remote_id(ep, config->key.am_lane);
         if (status != UCS_OK) {
             ucs_debug("ep %p: failed to resolve destination ep, "
                       "sw rma cannot be used", ep);
@@ -489,8 +513,8 @@ void ucp_rkey_resolve_inner(ucp_rkey_h rkey, ucp_ep_h ep)
 
     rkey->cache.ep_cfg_index  = ep->cfg_index;
 
-    ucs_trace("rkey %p ep %p @ cfg[%d] %s: lane[%d] rkey 0x%"PRIx64" "
-              "%s: lane[%d] rkey 0x%"PRIx64"",
+    ucs_trace("rkey %p ep %p @ cfg[%d] %s: lane[%d] rkey 0x%"PRIxPTR
+              " %s: lane[%d] rkey 0x%"PRIxPTR,
               rkey, ep, ep->cfg_index,
               rkey->cache.rma_proto->name, rkey->cache.rma_lane, rkey->cache.rma_rkey,
               rkey->cache.amo_proto->name, rkey->cache.amo_lane, rkey->cache.amo_rkey);

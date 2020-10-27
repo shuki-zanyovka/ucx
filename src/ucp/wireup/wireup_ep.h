@@ -35,6 +35,12 @@ struct ucp_wireup_ep {
     uct_ep_h                  aux_ep;        /**< Used to wireup the "real" endpoint */
     uct_ep_h                  sockaddr_ep;   /**< Used for client-server wireup */
     ucp_ep_h                  tmp_ep;        /**< Used by the client for local tls setup */
+    struct sockaddr_storage   cm_remote_sockaddr;  /**< sockaddr of the remote peer -
+                                                        used only on the client side
+                                                        in a client-server flow */
+    ucp_rsc_index_t           cm_idx;        /**< If this ucp_wireup_ep wraps a CM ep,
+                                                  this is the index of the CM resource
+                                                  on which it was created */
     ucp_rsc_index_t           aux_rsc_index; /**< Index of auxiliary transport */
     ucp_rsc_index_t           sockaddr_rsc_index; /**< Index of sockaddr transport */
     volatile uint32_t         pending_count; /**< Number of pending wireup operations */
@@ -78,6 +84,9 @@ ucs_status_t ucp_wireup_ep_connect(uct_ep_h uct_ep, unsigned ucp_ep_init_flags,
 ucs_status_t ucp_wireup_ep_connect_to_sockaddr(uct_ep_h uct_ep,
                                                const ucp_ep_params_t *params);
 
+void ucp_wireup_ep_set_aux(ucp_wireup_ep_t *wireup_ep, uct_ep_h uct_ep,
+                           ucp_rsc_index_t rsc_index);
+
 ucs_status_t
 ucp_wireup_ep_connect_aux(ucp_wireup_ep_t *wireup_ep, unsigned ep_init_flags,
                           const ucp_unpacked_address_t *remote_address);
@@ -85,6 +94,8 @@ ucp_wireup_ep_connect_aux(ucp_wireup_ep_t *wireup_ep, unsigned ep_init_flags,
 void ucp_wireup_ep_set_next_ep(uct_ep_h uct_ep, uct_ep_h next_ep);
 
 uct_ep_h ucp_wireup_ep_extract_next_ep(uct_ep_h uct_ep);
+
+void ucp_wireup_ep_destroy_next_ep(ucp_wireup_ep_t *wireup_ep);
 
 void ucp_wireup_ep_remote_connected(uct_ep_h uct_ep);
 

@@ -57,7 +57,7 @@
 
 #define UCM_MMAP_REPORT_BUF_LEN \
     ((UCM_MMAP_MAX_EVENT_NAME_LEN + 2) * \
-    ucs_array_size(ucm_mmap_event_name))
+    ucs_static_array_size(ucm_mmap_event_name))
 
 extern const char *ucm_mmap_hook_modes[];
 
@@ -174,8 +174,10 @@ ucm_fire_mmap_events_internal(int events, ucm_mmap_test_events_data_t *data)
 
         UCM_FIRE_EVENT(events, UCM_EVENT_SHMAT|UCM_EVENT_VM_MAPPED,
                        data, p = shmat(shmid, NULL, 0));
+#ifdef SHM_REMAP
         UCM_FIRE_EVENT(events, UCM_EVENT_SHMAT|UCM_EVENT_VM_MAPPED|UCM_EVENT_VM_UNMAPPED,
                        data, p = shmat(shmid, p, SHM_REMAP));
+#endif
         shmctl(shmid, IPC_RMID, NULL);
         UCM_FIRE_EVENT(events, UCM_EVENT_SHMDT|UCM_EVENT_VM_UNMAPPED,
                        data, shmdt(p));
@@ -233,7 +235,7 @@ static void ucm_mmap_event_report_missing(int expected, int actual,
     buf            = buf_p = ucs_alloca(UCM_MMAP_REPORT_BUF_LEN);
     end_p          = buf_p + UCM_MMAP_REPORT_BUF_LEN;
     missing_events = expected & ~actual &
-                     UCS_MASK(ucs_array_size(ucm_mmap_event_name));
+                     UCS_MASK(ucs_static_array_size(ucm_mmap_event_name));
 
     ucs_for_each_bit(idx, missing_events) {
         /* coverity[overrun-local] */

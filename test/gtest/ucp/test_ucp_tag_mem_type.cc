@@ -4,9 +4,10 @@
 * See file LICENSE for terms.
 */
 
-#include "test_ucp_tag.h"
+#include <common/test.h>
 #include <common/mem_buffer.h>
 
+#include "test_ucp_tag.h"
 #include "ucp_datatype.h"
 
 extern "C" {
@@ -132,7 +133,7 @@ size_t test_ucp_tag_mem_type::do_xfer(const void *sendbuf, void *recvbuf,
     wait(rreq);
     if (sreq != NULL) {
         wait(sreq);
-        request_release(sreq);
+        request_free(sreq);
     }
 
     recvd = rreq->info.length;
@@ -143,7 +144,7 @@ size_t test_ucp_tag_mem_type::do_xfer(const void *sendbuf, void *recvbuf,
         EXPECT_EQ(UCS_ERR_MESSAGE_TRUNCATED, rreq->status);
     }
 
-    request_release(rreq);
+    request_free(rreq);
     return recvd;
 };
 

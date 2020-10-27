@@ -6,6 +6,7 @@
 #ifndef UCP_TEST_H_
 #define UCP_TEST_H_
 
+#define __STDC_LIMIT_MACROS
 #include <ucp/api/ucp.h>
 #include <ucs/time/time.h>
 #include <common/mem_buffer.h>
@@ -92,7 +93,7 @@ public:
 
         void close_ep_req_free(void *close_req);
 
-        void close_all_eps(const ucp_test &test, int wirker_idx,
+        void close_all_eps(const ucp_test &test, int worker_idx,
                            enum ucp_ep_close_mode mode = UCP_EP_CLOSE_MODE_FLUSH);
 
         void destroy_worker(int worker_index = 0);
@@ -131,6 +132,8 @@ public:
         void cleanup();
 
         static void ep_destructor(ucp_ep_h ep, entity *e);
+
+        bool has_lane_with_caps(uint64_t caps) const;
 
     protected:
         ucs::handle<ucp_context_h>      m_ucph;
@@ -195,7 +198,7 @@ public:
                                  int thread_type = SINGLE_THREAD);
 
     virtual void modify_config(const std::string& name, const std::string& value,
-                               bool optional = false);
+                               modify_config_mode_t mode = FAIL_IF_NOT_EXIST);
     void stats_activate();
     void stats_restore();
 
@@ -205,6 +208,7 @@ private:
     static bool check_test_param(const std::string& name,
                                  const std::string& test_case_name,
                                  const ucp_test_param& test_param);
+    ucs_status_t request_process(void *req, int worker_index, bool wait);
 
 protected:
     virtual void init();
@@ -219,7 +223,8 @@ protected:
     void flush_ep(const entity &e, int worker_index = 0, int ep_index = 0);
     void flush_worker(const entity &e, int worker_index = 0);
     void disconnect(entity& entity);
-    void wait(void *req, int worker_index = 0);
+    ucs_status_t request_wait(void *req, int worker_index = 0);
+    void request_release(void *req);
     void set_ucp_config(ucp_config_t *config);
     int max_connections();
 

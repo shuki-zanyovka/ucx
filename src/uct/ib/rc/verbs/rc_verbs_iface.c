@@ -49,6 +49,7 @@ static void uct_rc_verbs_handle_failure(uct_ib_iface_t *ib_iface, void *arg,
     uct_rc_iface_t    *iface   = ucs_derived_of(ib_iface, uct_rc_iface_t);
     ucs_log_level_t    log_lvl = UCS_LOG_LEVEL_FATAL;
     uct_rc_verbs_ep_t *ep;
+    ucs_status_t       err_handler_status;
 
     ep = ucs_derived_of(uct_rc_iface_lookup_ep(iface, wc->qp_num),
                         uct_rc_verbs_ep_t);
@@ -56,9 +57,9 @@ static void uct_rc_verbs_handle_failure(uct_ib_iface_t *ib_iface, void *arg,
         return;
     }
 
-    if (uct_rc_verbs_ep_handle_failure(ep, status) == UCS_OK) {
-        log_lvl = iface->super.super.config.failure_level;
-    }
+    err_handler_status = uct_rc_verbs_ep_handle_failure(ep, status);
+    log_lvl            = uct_ib_iface_failure_log_level(ib_iface,
+                                                        err_handler_status, status);
 
     ucs_log(log_lvl,
             "send completion with error: %s qpn 0x%x wrid 0x%lx vendor_err 0x%x",
@@ -106,20 +107,22 @@ uct_rc_verbs_iface_poll_tx(uct_rc_verbs_iface_t *iface)
             continue;
         }
 
-        count = uct_rc_verbs_txcq_get_comp_count(&wc[i], &ep->super.txqp);
+        count = wc[i].wr_id - ep->txcnt.ci;
         ucs_trace_poll("rc_verbs iface %p tx_wc wrid 0x%lx ep %p qpn 0x%x count %d",
                        iface, wc[i].wr_id, ep, wc[i].qp_num, count);
-        uct_rc_verbs_txqp_completed(&ep->super.txqp, &ep->txcnt, count);
+        ep->txcnt.ci += count;
+
+        uct_rc_txqp_completion_desc(&ep->super.txqp, ep->txcnt.ci);
+
+        uct_rc_txqp_available_add(&ep->super.txqp, count);
         iface->super.tx.cq_available += count;
 
-       /* process pending elements prior to CQ entries to avoid out-of-order
-        * transmission in completion callbacks */
+        uct_rc_iface_update_reads(&iface->super);
+
         ucs_arbiter_group_schedule(&iface->super.tx.arbiter,
                                    &ep->super.arb_group);
         ucs_arbiter_dispatch(&iface->super.tx.arbiter, 1,
                              uct_rc_ep_process_pending, NULL);
-
-        uct_rc_txqp_completion_desc(&ep->super.txqp, ep->txcnt.ci);
     }
 
     return num_wcs;
@@ -156,6 +159,8 @@ static void uct_rc_verbs_iface_init_inl_wrs(uct_rc_verbs_iface_t *iface)
 static ucs_status_t uct_rc_verbs_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
 {
     uct_rc_verbs_iface_t *iface = ucs_derived_of(tl_iface, uct_rc_verbs_iface_t);
+    uct_ib_md_t *md             = uct_ib_iface_md(ucs_derived_of(iface, uct_ib_iface_t));
+    uint8_t mr_id;
     ucs_status_t status;
 
     status = uct_rc_iface_query(&iface->super, iface_attr,
@@ -172,7 +177,53 @@ static ucs_status_t uct_rc_verbs_iface_query(uct_iface_h tl_iface, uct_iface_att
     iface_attr->latency.m += 1e-9;  /* 1 ns per each extra QP */
     iface_attr->overhead   = 75e-9; /* Software overhead */
 
+    iface_attr->ep_addr_len = sizeof(uct_rc_verbs_ep_address_t);
+    if (md->ops->get_atomic_mr_id(md, &mr_id) == UCS_OK) {
+        iface_attr->ep_addr_len += sizeof(mr_id);
+    }
+
     return UCS_OK;
+}
+
+ucs_status_t uct_rc_verbs_iface_flush_mem_create(uct_rc_verbs_iface_t *iface)
+{
+    uct_ib_md_t *md = uct_ib_iface_md(&iface->super.super);
+    ucs_status_t status;
+    struct ibv_mr *mr;
+    void *mem;
+
+    if (iface->flush_mr != NULL) {
+        ucs_assert(iface->flush_mem != NULL);
+        return UCS_OK;
+    }
+
+    /*
+     * Map a whole page for the remote side to issue a dummy RDMA_WRITE on it,
+     * to flush its outstanding operations. A whole page is used to prevent any
+     * other allocations from using same page, so it would be fork-safe.
+     */
+    mem = ucs_mmap(NULL, ucs_get_page_size(), PROT_READ|PROT_WRITE,
+                   MAP_PRIVATE|MAP_ANONYMOUS, -1, 0, "flush_mem");
+    if (mem == MAP_FAILED) {
+        ucs_error("failed to allocate page for remote flush: %m");
+        status = UCS_ERR_NO_MEMORY;
+        goto err;
+    }
+
+    status = uct_ib_reg_mr(md->pd, mem, ucs_get_page_size(),
+                           UCT_IB_MEM_ACCESS_FLAGS, &mr, 0);
+    if (status != UCS_OK) {
+        goto err_munmap;
+    }
+
+    iface->flush_mem = mem;
+    iface->flush_mr  = mr;
+    return UCS_OK;
+
+err_munmap:
+    ucs_munmap(mem, ucs_get_page_size());
+err:
+    return status;
 }
 
 static ucs_status_t
@@ -192,8 +243,8 @@ void uct_rc_iface_verbs_cleanup_rx(uct_rc_iface_t *rc_iface)
     uct_ib_destroy_srq(iface->srq);
 }
 
-static UCS_CLASS_INIT_FUNC(uct_rc_verbs_iface_t, uct_md_h md, uct_worker_h worker,
-                           const uct_iface_params_t *params,
+static UCS_CLASS_INIT_FUNC(uct_rc_verbs_iface_t, uct_md_h tl_md,
+                           uct_worker_h worker, const uct_iface_params_t *params,
                            const uct_iface_config_t *tl_config)
 {
     uct_rc_verbs_iface_config_t *config =
@@ -204,14 +255,14 @@ static UCS_CLASS_INIT_FUNC(uct_rc_verbs_iface_t, uct_md_h md, uct_worker_h worke
     struct ibv_qp *qp;
     uct_rc_hdr_t *hdr;
 
-    init_attr.fc_req_size            = sizeof(uct_rc_fc_request_t);
+    init_attr.fc_req_size            = sizeof(uct_rc_pending_req_t);
     init_attr.rx_hdr_len             = sizeof(uct_rc_hdr_t);
     init_attr.qp_type                = IBV_QPT_RC;
     init_attr.cq_len[UCT_IB_DIR_RX]  = config->super.super.super.rx.queue_len;
     init_attr.cq_len[UCT_IB_DIR_TX]  = config->super.tx_cq_len;
     init_attr.seg_size               = config->super.super.super.seg_size;
 
-    UCS_CLASS_CALL_SUPER_INIT(uct_rc_iface_t, &uct_rc_verbs_iface_ops, md,
+    UCS_CLASS_CALL_SUPER_INIT(uct_rc_iface_t, &uct_rc_verbs_iface_ops, tl_md,
                               worker, params, &config->super.super, &init_attr);
 
     self->config.tx_max_wr           = ucs_min(config->tx_max_wr,
@@ -220,6 +271,8 @@ static UCS_CLASS_INIT_FUNC(uct_rc_verbs_iface_t, uct_md_h md, uct_worker_h worke
                                                self->config.tx_max_wr / 4);
     self->super.config.fence_mode    = (uct_rc_fence_mode_t)config->super.super.fence_mode;
     self->super.progress             = uct_rc_verbs_iface_progress;
+    self->flush_mem                  = NULL;
+    self->flush_mr                   = NULL;
 
     if ((config->super.super.fence_mode == UCT_RC_FENCE_MODE_WEAK) ||
         (config->super.super.fence_mode == UCT_RC_FENCE_MODE_AUTO)) {
@@ -358,6 +411,14 @@ static UCS_CLASS_CLEANUP_FUNC(uct_rc_verbs_iface_t)
 {
     uct_base_iface_progress_disable(&self->super.super.super.super,
                                     UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);
+
+    uct_rc_iface_cleanup_eps(&self->super);
+
+    if (self->flush_mr != NULL) {
+        uct_ib_dereg_mr(self->flush_mr);
+        ucs_assert(self->flush_mem != NULL);
+        ucs_munmap(self->flush_mem, ucs_get_page_size());
+    }
     if (self->fc_desc != NULL) {
         ucs_mpool_put(self->fc_desc);
     }
@@ -417,7 +478,8 @@ static uct_rc_iface_ops_t uct_rc_verbs_iface_ops = {
     .init_rx                  = uct_rc_iface_verbs_init_rx,
     .cleanup_rx               = uct_rc_iface_verbs_cleanup_rx,
     .fc_ctrl                  = uct_rc_verbs_ep_fc_ctrl,
-    .fc_handler               = uct_rc_iface_fc_handler
+    .fc_handler               = uct_rc_iface_fc_handler,
+    .cleanup_qp               = uct_rc_verbs_ep_cleanup_qp,
 };
 
 static ucs_status_t

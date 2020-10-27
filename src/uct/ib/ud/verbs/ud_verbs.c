@@ -50,7 +50,7 @@ UCS_CLASS_INIT_FUNC(uct_ud_verbs_ep_t, const uct_ep_params_t *params)
 
     ucs_trace_func("");
     UCS_CLASS_CALL_SUPER_INIT(uct_ud_ep_t, &iface->super, params);
-    self->ah = NULL;
+    self->peer_address.ah = NULL;
     return UCS_OK;
 }
 
@@ -85,8 +85,8 @@ uct_ud_verbs_post_send(uct_ud_verbs_iface_t *iface, uct_ud_verbs_ep_t *ep,
         ++iface->super.tx.unsignaled;
     }
 
-    wr->wr.ud.remote_qpn = ep->dest_qpn;
-    wr->wr.ud.ah         = ep->ah;
+    wr->wr.ud.remote_qpn = ep->peer_address.dest_qpn;
+    wr->wr.ud.ah         = ep->peer_address.ah;
 
     UCT_UD_EP_HOOK_CALL_TX(&ep->super, (uct_ud_neth_t*)iface->tx.sge[0].addr);
     ret = ibv_post_send(iface->super.qp, wr, &bad_wr);
@@ -366,8 +366,7 @@ uct_ud_verbs_iface_poll_rx(uct_ud_verbs_iface_t *iface, int is_async)
     }
 
     UCT_IB_IFACE_VERBS_FOREACH_RXWQE(&iface->super.super, i, packet, wc, num_wcs) {
-        if (!uct_ud_iface_check_grh(&iface->super,
-                                    UCS_PTR_BYTE_OFFSET(packet, UCT_IB_GRH_LEN),
+        if (!uct_ud_iface_check_grh(&iface->super, packet,
                                     wc[i].wc_flags & IBV_WC_GRH)) {
             ucs_mpool_put_inline((void*)wc[i].wr_id);
             continue;
@@ -459,87 +458,54 @@ uct_ud_verbs_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
 }
 
 static ucs_status_t
-uct_ud_verbs_ep_create_connected(uct_iface_h iface_h, const uct_device_addr_t *dev_addr,
-                                 const uct_iface_addr_t *iface_addr,
-                                 unsigned path_index, uct_ep_h *new_ep_p)
+uct_ud_verbs_iface_unpack_peer_address(uct_ud_iface_t *iface,
+                                       const uct_ib_address_t *ib_addr,
+                                       const uct_ud_iface_addr_t *if_addr,
+                                       int path_index, void *address_p)
 {
-    uct_ud_verbs_iface_t *iface = ucs_derived_of(iface_h, uct_ud_verbs_iface_t);
-    uct_ib_iface_t       *ib_iface = &iface->super.super;
-    uct_ud_verbs_ep_t *ep;
-    uct_ud_ep_t *new_ud_ep;
-    const uct_ib_address_t *ib_addr = (const uct_ib_address_t *)dev_addr;
-    const uct_ud_iface_addr_t *if_addr = (const uct_ud_iface_addr_t *)iface_addr;
-    uct_ud_send_skb_t *skb;
-    ucs_status_t status, status_ah;
+    uct_ib_iface_t *ib_iface                     = &iface->super;
+    uct_ud_verbs_ep_peer_address_t *peer_address =
+        (uct_ud_verbs_ep_peer_address_t*)address_p;
     struct ibv_ah_attr ah_attr;
     enum ibv_mtu path_mtu;
-
-    uct_ud_enter(&iface->super);
-    status = uct_ud_ep_create_connected_common(&iface->super, ib_addr, if_addr,
-                                               path_index, &new_ud_ep, &skb);
-    if (status != UCS_OK &&
-        status != UCS_ERR_NO_RESOURCE &&
-        status != UCS_ERR_ALREADY_EXISTS) {
-        uct_ud_leave(&iface->super);
-        return status;
-    }
-
-    ep = ucs_derived_of(new_ud_ep, uct_ud_verbs_ep_t);
-    /* cppcheck-suppress autoVariables */
-    *new_ep_p = &ep->super.super.super;
-    if (status == UCS_ERR_ALREADY_EXISTS) {
-        uct_ud_leave(&iface->super);
-        return UCS_OK;
-    }
-
-    ucs_assert_always(ep->ah == NULL);
-
-    uct_ib_iface_fill_ah_attr_from_addr(ib_iface, ib_addr, ep->super.path_index,
-                                        &ah_attr, &path_mtu);
-    status_ah = uct_ib_iface_create_ah(ib_iface, &ah_attr, &ep->ah);
-    if (status_ah != UCS_OK) {
-        uct_ud_ep_destroy_connected(&ep->super, ib_addr, if_addr);
-        *new_ep_p = NULL;
-        uct_ud_leave(&iface->super);
-        return status_ah;
-    }
-
-    ep->dest_qpn = uct_ib_unpack_uint24(if_addr->qp_num);
-
-    if (status == UCS_OK) {
-        uct_ud_verbs_ep_send_ctl(&ep->super, skb, NULL, 0,
-                                 UCT_UD_IFACE_SEND_CTL_FLAG_SOLICITED, 1);
-        uct_ud_iface_complete_tx_skb(&iface->super, &ep->super, skb);
-        ep->super.flags |= UCT_UD_EP_FLAG_CREQ_SENT;
-    }
-    uct_ud_leave(&iface->super);
-    return UCS_OK;
-}
-
-
-static ucs_status_t
-uct_ud_verbs_ep_connect_to_ep(uct_ep_h tl_ep,
-                              const uct_device_addr_t *dev_addr,
-                              const uct_ep_addr_t *ep_addr)
-{
-    uct_ud_verbs_ep_t *ep = ucs_derived_of(tl_ep, uct_ud_verbs_ep_t);
-    uct_ib_iface_t *iface = ucs_derived_of(tl_ep->iface, uct_ib_iface_t);
-    const uct_ib_address_t *ib_addr = (const uct_ib_address_t *)dev_addr;
-    const uct_ud_ep_addr_t *ud_ep_addr = (const uct_ud_ep_addr_t *)ep_addr;
     ucs_status_t status;
-    struct ibv_ah_attr ah_attr;
-    enum ibv_mtu path_mtu;
 
-    status = uct_ud_ep_connect_to_ep(&ep->super, ib_addr, ud_ep_addr);
+    memset(peer_address, 0, sizeof(*peer_address));
+
+    uct_ib_iface_fill_ah_attr_from_addr(ib_iface, ib_addr, path_index,
+                                        &ah_attr, &path_mtu);
+    status = uct_ib_iface_create_ah(ib_iface, &ah_attr, &peer_address->ah);
     if (status != UCS_OK) {
         return status;
     }
-    ucs_assert_always(ep->ah == NULL);
-    ep->dest_qpn = uct_ib_unpack_uint24(ud_ep_addr->iface_addr.qp_num);
 
-    uct_ib_iface_fill_ah_attr_from_addr(iface, ib_addr, ep->super.path_index,
-                                        &ah_attr, &path_mtu);
-    return uct_ib_iface_create_ah(iface, &ah_attr, &ep->ah);
+    peer_address->dest_qpn = uct_ib_unpack_uint24(if_addr->qp_num);
+
+    return UCS_OK;
+}
+
+static void *uct_ud_verbs_ep_get_peer_address(uct_ud_ep_t *ud_ep)
+{
+    uct_ud_verbs_ep_t *ep = ucs_derived_of(ud_ep, uct_ud_verbs_ep_t);
+    return &ep->peer_address;
+}
+
+static size_t uct_ud_verbs_get_peer_address_length()
+{
+    return sizeof(uct_ud_verbs_ep_peer_address_t);
+}
+
+static const char*
+uct_ud_verbs_iface_peer_address_str(const uct_ud_iface_t *iface,
+                                    const void *address,
+                                    char *str, size_t max_size)
+{
+    const uct_ud_verbs_ep_peer_address_t *peer_address =
+        (const uct_ud_verbs_ep_peer_address_t*)address;
+
+    ucs_snprintf_zero(str, max_size, "ah=%p dest_qpn=%u",
+                      peer_address->ah, peer_address->dest_qpn);
+    return str;
 }
 
 static ucs_status_t
@@ -547,10 +513,7 @@ uct_ud_verbs_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
 {
     if (ucs_test_all_flags(params->field_mask, UCT_EP_PARAM_FIELD_DEV_ADDR |
                                                UCT_EP_PARAM_FIELD_IFACE_ADDR)) {
-        return uct_ud_verbs_ep_create_connected(params->iface, params->dev_addr,
-                                                params->iface_addr,
-                                                UCT_EP_PARAMS_GET_PATH_INDEX(params),
-                                                ep_p);
+        return uct_ud_ep_create_connected_common(params, ep_p);
     }
 
     return uct_ud_verbs_ep_t_new(params, ep_p);
@@ -572,7 +535,7 @@ static uct_ud_iface_ops_t uct_ud_verbs_iface_ops = {
     .ep_create                = uct_ud_verbs_ep_create,
     .ep_destroy               = uct_ud_ep_disconnect,
     .ep_get_address           = uct_ud_ep_get_address,
-    .ep_connect_to_ep         = uct_ud_verbs_ep_connect_to_ep,
+    .ep_connect_to_ep         = uct_ud_ep_connect_to_ep,
     .iface_flush              = uct_ud_iface_flush,
     .iface_fence              = uct_base_iface_fence,
     .iface_progress_enable    = uct_ud_iface_progress_enable,
@@ -597,6 +560,10 @@ static uct_ud_iface_ops_t uct_ud_verbs_iface_ops = {
     .send_ctl                 = uct_ud_verbs_ep_send_ctl,
     .ep_free                  = UCS_CLASS_DELETE_FUNC_NAME(uct_ud_verbs_ep_t),
     .create_qp                = uct_ib_iface_create_qp,
+    .unpack_peer_address      = uct_ud_verbs_iface_unpack_peer_address,
+    .ep_get_peer_address      = uct_ud_verbs_ep_get_peer_address,
+    .get_peer_address_length  = uct_ud_verbs_get_peer_address_length,
+    .peer_address_str         = uct_ud_verbs_iface_peer_address_str
 };
 
 static UCS_F_NOINLINE void
@@ -713,9 +680,6 @@ static UCS_CLASS_CLEANUP_FUNC(uct_ud_verbs_iface_t)
 {
     ucs_trace_func("");
     uct_ud_iface_remove_async_handlers(&self->super);
-    uct_ud_enter(&self->super);
-    UCT_UD_IFACE_DELETE_EPS(&self->super, uct_ud_verbs_ep_t);
-    uct_ud_leave(&self->super);
 }
 
 UCS_CLASS_DEFINE(uct_ud_verbs_iface_t, uct_ud_iface_t);

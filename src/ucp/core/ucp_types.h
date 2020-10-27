@@ -23,7 +23,7 @@
 typedef uint8_t                      ucp_rsc_index_t;
 
 /* MDs */
-#define UCP_UINT_TYPE(_bits)         typedef UCS_PP_TOKENPASTE(UCS_PP_TOKENPASTE(uint, _bits), _t)
+#define UCP_UINT_TYPE(_bits)         typedef UCS_PP_TOKENPASTE3(uint, _bits, _t)
 #define UCP_MD_INDEX_BITS            64  /* How many bits are in MD index */
 typedef ucp_rsc_index_t              ucp_md_index_t;
 #define UCP_MAX_MDS                  ucs_min(UCP_MD_INDEX_BITS, UCP_MAX_RESOURCES)
@@ -36,8 +36,11 @@ UCP_UINT_TYPE(UCP_MD_INDEX_BITS)     ucp_md_map_t;
 typedef uint8_t                      ucp_lane_index_t;
 typedef uint8_t                      ucp_lane_map_t;
 
-/* Connection sequence number */
-typedef uint16_t                     ucp_ep_conn_sn_t;
+/* Worker configuration index for endpoint and rkey */
+typedef uint8_t                      ucp_worker_cfg_index_t;
+#define UCP_WORKER_MAX_EP_CONFIG     16
+#define UCP_WORKER_MAX_RKEY_CONFIG   128
+#define UCP_WORKER_CFG_INDEX_NULL    UINT8_MAX
 
 /* Forward declarations */
 typedef struct ucp_request              ucp_request_t;
@@ -54,13 +57,26 @@ typedef struct ucp_amo_proto            ucp_amo_proto_t;
 typedef struct ucp_wireup_sockaddr_data ucp_wireup_sockaddr_data_t;
 typedef struct ucp_ep_config            ucp_ep_config_t;
 typedef struct ucp_ep_config_key        ucp_ep_config_key_t;
+typedef struct ucp_rkey_config_key      ucp_rkey_config_key_t;
 typedef struct ucp_proto                ucp_proto_t;
+
+
+/**
+ * Operation for which protocol is selected
+ */
+typedef enum {
+    UCP_OP_ID_TAG_SEND,
+    UCP_OP_ID_TAG_SEND_SYNC,
+    UCP_OP_ID_PUT,
+    UCP_OP_ID_GET,
+    UCP_OP_ID_LAST
+} ucp_operation_id_t;
 
 
 /**
  * Active message codes
  */
-enum {
+typedef enum {
     UCP_AM_ID_WIREUP            =  1, /* Connection establishment */
 
     UCP_AM_ID_EAGER_ONLY        =  2, /* Single packet eager TAG */
@@ -96,7 +112,7 @@ enum {
     UCP_AM_ID_SINGLE_REPLY      =  26, /* Single fragment user defined AM
                                           carrying remote ep for reply */
     UCP_AM_ID_LAST
-};
+} ucp_am_id_t;
 
 
 /**

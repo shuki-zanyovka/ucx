@@ -233,7 +233,7 @@ uct_rc_mlx5_devx_create_cmd_qp(uct_rc_mlx5_iface_common_t *iface)
     return UCS_OK;
 
 err_destroy_qp:
-    uct_ib_mlx5_devx_destroy_qp(&iface->tm.cmd_wq.super.super);
+    uct_ib_mlx5_devx_destroy_qp(md, &iface->tm.cmd_wq.super.super);
     return status;
 }
 
@@ -405,6 +405,8 @@ err_tag_cleanup:
 
 void uct_rc_mlx5_iface_common_tag_cleanup(uct_rc_mlx5_iface_common_t *iface)
 {
+    uct_ib_mlx5_md_t *md = ucs_derived_of(iface->super.super.super.md,
+                                          uct_ib_mlx5_md_t);
     uct_rc_mlx5_mp_hash_key_t key_gid;
     uint64_t key_lid;
     void *recv_buffer;
@@ -413,8 +415,9 @@ void uct_rc_mlx5_iface_common_tag_cleanup(uct_rc_mlx5_iface_common_t *iface)
         return;
     }
 
-    uct_ib_mlx5_destroy_qp(&iface->tm.cmd_wq.super.super);
-    uct_ib_mlx5_txwq_cleanup(&iface->tm.cmd_wq.super);
+    uct_ib_mlx5_destroy_qp(md, &iface->tm.cmd_wq.super.super);
+    uct_ib_mlx5_qp_mmio_cleanup(&iface->tm.cmd_wq.super.super,
+                                iface->tm.cmd_wq.super.reg);
     ucs_free(iface->tm.list);
     ucs_free(iface->tm.cmd_wq.ops);
     uct_rc_mlx5_tag_cleanup(iface);
@@ -480,6 +483,7 @@ ucs_status_t
 uct_rc_mlx5_common_iface_init_rx(uct_rc_mlx5_iface_common_t *iface,
                                  const uct_rc_iface_common_config_t *rc_config)
 {
+    uct_ib_mlx5_md_t *md = ucs_derived_of(iface->super.super.super.md, uct_ib_mlx5_md_t);
     ucs_status_t status;
 
     status = uct_rc_mlx5_iface_check_no_devx_rx(iface);
@@ -504,12 +508,12 @@ uct_rc_mlx5_common_iface_init_rx(uct_rc_mlx5_iface_common_t *iface,
     return UCS_OK;
 
 err_free_srq:
-    uct_rc_mlx5_destroy_srq(&iface->rx.srq);
+    uct_rc_mlx5_destroy_srq(md, &iface->rx.srq);
 err:
     return status;
 }
 
-void uct_rc_mlx5_destroy_srq(uct_ib_mlx5_srq_t *srq)
+void uct_rc_mlx5_destroy_srq(uct_ib_mlx5_md_t *md, uct_ib_mlx5_srq_t *srq)
 {
     int UCS_V_UNUSED ret;
 
@@ -523,7 +527,7 @@ void uct_rc_mlx5_destroy_srq(uct_ib_mlx5_srq_t *srq)
         if (ret) {
             ucs_warn("mlx5dv_devx_obj_destroy(SRQ) failed: %m");
         }
-        uct_rc_mlx5_devx_cleanup_srq(srq);
+        uct_rc_mlx5_devx_cleanup_srq(md, srq);
 #endif
         break;
     case UCT_IB_MLX5_OBJ_TYPE_LAST:
@@ -959,6 +963,44 @@ void uct_rc_mlx5_iface_common_dm_cleanup(uct_rc_mlx5_iface_common_t *iface)
 #endif
 }
 
+#if HAVE_DECL_MLX5DV_CREATE_QP
+void uct_rc_mlx5_common_fill_dv_qp_attr(uct_rc_mlx5_iface_common_t *iface,
+                                        struct ibv_qp_init_attr_ex *qp_attr,
+                                        struct mlx5dv_qp_init_attr *dv_attr,
+                                        unsigned scat2cqe_dir_mask)
+{
+#if HAVE_DECL_MLX5DV_QP_CREATE_ALLOW_SCATTER_TO_CQE
+    dv_attr->comp_mask   |= MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS;
+    dv_attr->create_flags = 0;
+
+    if ((scat2cqe_dir_mask & UCS_BIT(UCT_IB_DIR_RX)) &&
+        (iface->super.super.config.max_inl_cqe[UCT_IB_DIR_RX] == 0)) {
+        /* make sure responder scatter2cqe is disabled */
+        dv_attr->create_flags |= MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
+    }
+#endif
+
+    if (scat2cqe_dir_mask & UCS_BIT(UCT_IB_DIR_TX)) {
+        if (iface->super.super.config.max_inl_cqe[UCT_IB_DIR_TX] == 0) {
+            /* Tell the driver to not signal all send WRs, so it will disable
+             * requester scatter2cqe. Set this also for older driver which
+             * doesn't support specific scatter2cqe flags.
+             */
+            qp_attr->sq_sig_all = 0;
+        }
+#if HAVE_DECL_MLX5DV_QP_CREATE_ALLOW_SCATTER_TO_CQE
+        else if (!(dv_attr->create_flags &
+                   MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE)) {
+            /* force-enable requester scatter2cqe, regardless of SIGNAL_ALL_WR,
+             * unless it was already disabled on responder side (otherwise
+             * mlx5 driver check fails) */
+            dv_attr->create_flags |= MLX5DV_QP_CREATE_ALLOW_SCATTER_TO_CQE;
+        }
+#endif
+    }
+}
+#endif
+
 void uct_rc_mlx5_iface_common_query(uct_ib_iface_t *ib_iface,
                                     uct_iface_attr_t *iface_attr,
                                     size_t max_inline, size_t max_tag_eager_iov)
@@ -1046,6 +1088,38 @@ void uct_rc_mlx5_iface_common_sync_cqs_ci(uct_rc_mlx5_iface_common_t *iface,
     iface->cq[UCT_IB_DIR_TX].cq_ci = uct_ib_mlx5_get_cq_ci(ib_iface->cq[UCT_IB_DIR_TX]);
     iface->cq[UCT_IB_DIR_RX].cq_ci = uct_ib_mlx5_get_cq_ci(ib_iface->cq[UCT_IB_DIR_RX]);
 #endif
+}
+
+void uct_rc_mlx5_iface_common_check_cqs_ci(uct_rc_mlx5_iface_common_t *iface,
+                                           uct_ib_iface_t *ib_iface)
+{
+#if !HAVE_DECL_MLX5DV_INIT_OBJ
+    ucs_assert(iface->cq[UCT_IB_DIR_TX].cq_ci == uct_ib_mlx5_get_cq_ci(ib_iface->cq[UCT_IB_DIR_TX]));
+    ucs_assert(iface->cq[UCT_IB_DIR_RX].cq_ci == uct_ib_mlx5_get_cq_ci(ib_iface->cq[UCT_IB_DIR_RX]));
+#endif
+}
+
+ucs_status_t
+uct_rc_mlx5_iface_common_arm_cq(uct_ib_iface_t *ib_iface, uct_ib_dir_t dir,
+                                int solicited_only)
+{
+    uct_rc_mlx5_iface_common_t *iface = ucs_derived_of(ib_iface,
+                                                       uct_rc_mlx5_iface_common_t);
+#if HAVE_DECL_MLX5DV_INIT_OBJ
+    return uct_ib_mlx5dv_arm_cq(&iface->cq[dir], solicited_only);
+#else
+    uct_ib_mlx5_update_cq_ci(iface->super.super.cq[dir],
+                             iface->cq[dir].cq_ci);
+    return uct_ib_iface_arm_cq(ib_iface, dir, solicited_only);
+#endif
+}
+
+void uct_rc_mlx5_iface_common_event_cq(uct_ib_iface_t *ib_iface,
+                                       uct_ib_dir_t dir)
+{
+    uct_rc_mlx5_iface_common_t *iface = ucs_derived_of(ib_iface,
+                                                       uct_rc_mlx5_iface_common_t);
+    iface->cq[dir].cq_sn++;
 }
 
 int uct_rc_mlx5_iface_commom_clean(uct_ib_mlx5_cq_t *mlx5_cq,

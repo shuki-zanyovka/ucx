@@ -43,9 +43,14 @@ ucs_status_t uct_rdmacm_cm_ack_event(struct rdma_cm_event *event)
 
 ucs_status_t uct_rdmacm_cm_reject(struct rdma_cm_id *id)
 {
+    uct_rdmacm_priv_data_hdr_t hdr;
+
+    hdr.length = 0;
+    hdr.status = (uint8_t)UCS_ERR_REJECTED;
+
     ucs_trace("reject on cm_id %p", id);
 
-    if (rdma_reject(id, NULL, 0)) {
+    if (rdma_reject(id, &hdr, sizeof(hdr))) {
         ucs_error("rdma_reject (id=%p) failed with error: %m", id);
         return UCS_ERR_IO_ERROR;
     }
@@ -106,7 +111,14 @@ static void uct_rdmacm_cm_handle_event_route_resolved(struct rdma_cm_event *even
     conn_param.private_data = ucs_alloca(uct_rdmacm_cm_get_max_conn_priv() +
                                          sizeof(uct_rdmacm_priv_data_hdr_t));
 
-    status = uct_rdmacm_cm_ep_conn_param_init(cep, &conn_param);
+    status = uct_rdmacm_cm_ep_pack_cb(cep, &conn_param);
+    if (status != UCS_OK) {
+        cep->status = status;
+        cep->flags |= UCT_RDMACM_CM_EP_FAILED;
+        return;
+    }
+
+    status = uct_rdamcm_cm_ep_set_qp_num(&conn_param, cep);
     if (status != UCS_OK) {
         remote_data.field_mask = 0;
         uct_rdmacm_cm_ep_set_failed(cep, &remote_data, status);
@@ -139,6 +151,7 @@ static ucs_status_t uct_rdmacm_cm_id_to_dev_addr(struct rdma_cm_id *cm_id,
     char dev_name[UCT_DEVICE_NAME_MAX];
     char ah_attr_str[128];
     uct_ib_roce_version_info_t roce_info;
+    int ret;
 
     params.flags = 0;
 
@@ -147,24 +160,24 @@ static ucs_status_t uct_rdmacm_cm_id_to_dev_addr(struct rdma_cm_id *cm_id,
      * of the remote peer.
      */
     qp_attr.qp_state = IBV_QPS_RTR;
-    if (rdma_init_qp_attr(cm_id, &qp_attr, &qp_attr_mask)) {
+    ret              = rdma_init_qp_attr(cm_id, &qp_attr, &qp_attr_mask);
+    if (ret) {
         ucs_error("rdma_init_qp_attr (id=%p, qp_state=%d) failed: %m",
                   cm_id, qp_attr.qp_state);
         return UCS_ERR_IO_ERROR;
     }
 
-    if (ibv_query_port(cm_id->verbs, cm_id->port_num, &port_attr)) {
+    ret = ibv_query_port(cm_id->pd->context, cm_id->port_num, &port_attr);
+    if (ret) {
         uct_rdmacm_cm_id_to_dev_name(cm_id, dev_name);
         ucs_error("ibv_query_port (%s) failed: %m", dev_name);
         return UCS_ERR_IO_ERROR;
     }
 
     if (qp_attr.ah_attr.is_global) {
-        ucs_assert(!memcmp(&cm_id->route.addr.addr.ibaddr.dgid,
-                           &qp_attr.ah_attr.grh.dgid,
-                           sizeof(qp_attr.ah_attr.grh.dgid)));
         params.flags    |= UCT_IB_ADDRESS_PACK_FLAG_GID_INDEX;
         params.gid_index = qp_attr.ah_attr.grh.sgid_index;
+        params.gid       = qp_attr.ah_attr.grh.dgid;
     }
 
     ucs_debug("cm_id %p: ah_attr %s", cm_id,
@@ -184,12 +197,26 @@ static ucs_status_t uct_rdmacm_cm_id_to_dev_addr(struct rdma_cm_id *cm_id,
         roce_info.addr_family = 0;
         params.roce_info      = roce_info;
         params.flags         |= UCT_IB_ADDRESS_PACK_FLAG_ETH;
+    } else if (qp_attr.ah_attr.is_global) {
+        params.flags         |= UCT_IB_ADDRESS_PACK_FLAG_SUBNET_PREFIX |
+                                UCT_IB_ADDRESS_PACK_FLAG_INTERFACE_ID;
     } else {
-        params.flags         |= UCT_IB_ADDRESS_PACK_FLAG_INTERFACE_ID |
-                                UCT_IB_ADDRESS_PACK_FLAG_SUBNET_PREFIX;
+        /* For local IB address, assume the remote subnet prefix is the same
+         * and pack it to make reachability check pass */
+        ret = ibv_query_gid(cm_id->verbs, cm_id->port_num,
+                            UCT_IB_MD_DEFAULT_GID_INDEX, &params.gid);
+        if (ret) {
+            ucs_error("ibv_query_gid(dev=%s port=%d index=%d) failed: %m",
+                      ibv_get_device_name(cm_id->verbs->device),
+                      cm_id->port_num, UCT_IB_MD_DEFAULT_GID_INDEX);
+            return UCS_ERR_IO_ERROR;
+        }
+
+        params.gid_index = UCT_IB_MD_DEFAULT_GID_INDEX;
+        params.flags    |= UCT_IB_ADDRESS_PACK_FLAG_SUBNET_PREFIX |
+                           UCT_IB_ADDRESS_PACK_FLAG_GID_INDEX;
     }
 
-    params.gid  = cm_id->route.addr.addr.ibaddr.dgid;
     params.lid  = qp_attr.ah_attr.dlid;
     addr_length = uct_ib_address_size(&params);
     dev_addr    = ucs_malloc(addr_length, "IB device address");
@@ -353,26 +380,47 @@ static void uct_rdmacm_cm_handle_error_event(struct rdma_cm_event *event)
     char ip_port_str[UCS_SOCKADDR_STRING_LEN];
     char ep_str[UCT_RDMACM_EP_STRING_LEN];
     uct_cm_remote_data_t remote_data;
+    const uct_rdmacm_priv_data_hdr_t *hdr;
     ucs_log_level_t log_level;
     ucs_status_t status;
 
-    if (event->event == RDMA_CM_EVENT_REJECTED) {
+    switch (event->event) {
+    case RDMA_CM_EVENT_REJECTED:
         if (cep->flags & UCT_RDMACM_CM_EP_ON_SERVER) {
             /* response was rejected by the client in the middle of
              * connection establishment, so report connection reset */
             status = UCS_ERR_CONNECTION_RESET;
         } else {
             ucs_assert(cep->flags & UCT_RDMACM_CM_EP_ON_CLIENT);
-            status = UCS_ERR_REJECTED;
+            hdr = (const uct_rdmacm_priv_data_hdr_t *)event->param.conn.private_data;
+
+            if ((hdr != NULL) && (event->param.conn.private_data_len > 0) &&
+                ((ucs_status_t)hdr->status == UCS_ERR_REJECTED)) {
+                ucs_assert(hdr->length == 0);
+                /* the actual amount of data transferred to the remote side is
+                 * transport dependent and may be larger than that requested.*/
+                ucs_assert(event->param.conn.private_data_len >= sizeof(*hdr));
+                status = UCS_ERR_REJECTED;
+            } else {
+                status = UCS_ERR_UNREACHABLE;
+            }
         }
 
         log_level = UCS_LOG_LEVEL_DEBUG;
-    } else {
+        break;
+    case RDMA_CM_EVENT_UNREACHABLE:
+    case RDMA_CM_EVENT_ADDR_ERROR:
+    case RDMA_CM_EVENT_ROUTE_ERROR:
+    case RDMA_CM_EVENT_CONNECT_ERROR:
+        status    = UCS_ERR_UNREACHABLE;
+        log_level = uct_rdmacm_cm_ep_get_cm(cep)->super.config.failure_level;
+        break;
+    default:
         status    = UCS_ERR_IO_ERROR;
         log_level = UCS_LOG_LEVEL_ERROR;
     }
 
-    ucs_log(log_level, "%s: got error event %s, status %d peer %s",
+    ucs_log(log_level, "%s: got error event %s, event status %d peer %s",
             uct_rdmacm_cm_ep_str(cep, ep_str, UCT_RDMACM_EP_STRING_LEN),
             rdma_event_str(event->event), event->status,
             ucs_sockaddr_str(remote_addr, ip_port_str,
@@ -463,7 +511,8 @@ uct_rdmacm_cm_process_event(uct_rdmacm_cm_t *cm, struct rdma_cm_event *event)
     }
 }
 
-static void uct_rdmacm_cm_event_handler(int fd, int events, void *arg)
+static void uct_rdmacm_cm_event_handler(int fd, ucs_event_set_types_t events,
+                                        void *arg)
 {
     uct_rdmacm_cm_t      *cm = (uct_rdmacm_cm_t *)arg;
     struct rdma_cm_event *event;
@@ -540,7 +589,8 @@ UCS_CLASS_INIT_FUNC(uct_rdmacm_cm_t, uct_component_h component,
     ucs_status_t status;
 
     UCS_CLASS_CALL_SUPER_INIT(uct_cm_t, &uct_rdmacm_cm_ops,
-                              &uct_rdmacm_cm_iface_ops, worker, component);
+                              &uct_rdmacm_cm_iface_ops, worker, component,
+                              config);
 
     self->ev_ch  = rdma_create_event_channel();
     if (self->ev_ch == NULL) {

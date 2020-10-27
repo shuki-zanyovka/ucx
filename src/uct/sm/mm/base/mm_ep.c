@@ -10,6 +10,7 @@
 #endif
 
 #include "mm_ep.h"
+#include "uct/sm/base/sm_ep.h"
 
 #include <ucs/arch/atomic.h>
 
@@ -25,9 +26,10 @@ typedef enum {
  * i.e. check if the remote receive FIFO has room in it.
  * return 1 if can send.
  * return 0 if can't send.
+ * We compare after casting to int32 in order to ignore the event arm bit.
  */
 #define UCT_MM_EP_IS_ABLE_TO_SEND(_head, _tail, _fifo_size) \
-    ucs_likely(((_head) - (_tail)) < (_fifo_size))
+    ucs_likely((int32_t)((_head) - (_tail)) < (int32_t)(_fifo_size))
 
 
 static UCS_F_NOINLINE ucs_status_t
@@ -149,7 +151,7 @@ static UCS_CLASS_INIT_FUNC(uct_mm_ep_t, const uct_ep_params_t *params)
     status = uct_mm_ep_get_remote_seg(self, addr->fifo_seg_id,
                                       UCT_MM_GET_FIFO_SIZE(iface), &fifo_ptr);
     if (status != UCS_OK) {
-        ucs_error("mm ep failed to connect to remote FIFO id 0x%lx: %s",
+        ucs_error("mm ep failed to connect to remote FIFO id 0x%"PRIx64": %s",
                   addr->fifo_seg_id, ucs_status_string(status));
         goto err_free_md_addr;
     }
@@ -159,8 +161,9 @@ static UCS_CLASS_INIT_FUNC(uct_mm_ep_t, const uct_ep_params_t *params)
     self->cached_tail     = self->fifo_ctl->tail;
     self->signal.addrlen  = self->fifo_ctl->signal_addrlen;
     self->signal.sockaddr = self->fifo_ctl->signal_sockaddr;
+    self->keepalive       = NULL;
 
-    ucs_debug("created mm ep %p, connected to remote FIFO id 0x%lx",
+    ucs_debug("created mm ep %p, connected to remote FIFO id 0x%"PRIx64,
               self, addr->fifo_seg_id);
 
     return UCS_OK;
@@ -176,6 +179,7 @@ static UCS_CLASS_CLEANUP_FUNC(uct_mm_ep_t)
     uct_mm_iface_t  *iface = ucs_derived_of(self->super.super.iface, uct_mm_iface_t);
     uct_mm_remote_seg_t remote_seg;
 
+    ucs_free(self->keepalive);
     uct_mm_ep_pending_purge(&self->super.super, NULL, NULL);
 
     kh_foreach_value(&self->remote_segs, remote_seg, {
@@ -191,20 +195,22 @@ UCS_CLASS_DEFINE_NEW_FUNC(uct_mm_ep_t, uct_ep_t, const uct_ep_params_t *);
 UCS_CLASS_DEFINE_DELETE_FUNC(uct_mm_ep_t, uct_ep_t);
 
 
-static inline ucs_status_t uct_mm_ep_get_remote_elem(uct_mm_ep_t *ep, uint64_t head,
-                                                     uct_mm_fifo_element_t **elem)
+static inline ucs_status_t
+uct_mm_ep_get_remote_elem(uct_mm_ep_t *ep, uint64_t head,
+                          uct_mm_fifo_element_t **elem)
 {
     uct_mm_iface_t *iface = ucs_derived_of(ep->super.super.iface, uct_mm_iface_t);
-    uint64_t elem_index;       /* the fifo elem's index in the fifo. */
-                               /* must be smaller than fifo size */
-    uint64_t returned_val;
+    uint64_t new_head, prev_head;
+    uint64_t elem_index;   /* index of the element to write */
 
-    elem_index = ep->fifo_ctl->head & iface->fifo_mask;
+    elem_index = head & iface->fifo_mask;
     *elem      = UCT_MM_IFACE_GET_FIFO_ELEM(iface, ep->fifo_elems, elem_index);
+    new_head   = (head + 1) & ~UCT_MM_IFACE_FIFO_HEAD_EVENT_ARMED;
 
     /* try to get ownership of the head element */
-    returned_val = ucs_atomic_cswap64(ucs_unaligned_ptr(&ep->fifo_ctl->head), head, head+1);
-    if (returned_val != head) {
+    prev_head = ucs_atomic_cswap64(ucs_unaligned_ptr(&ep->fifo_ctl->head), head,
+                                   new_head);
+    if (prev_head != head) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -226,8 +232,7 @@ static UCS_F_ALWAYS_INLINE ssize_t
 uct_mm_ep_am_common_send(uct_mm_send_op_t send_op, uct_mm_ep_t *ep,
                          uct_mm_iface_t *iface, uint8_t am_id, size_t length,
                          uint64_t header, const void *payload,
-                         uct_pack_callback_t pack_cb, void *arg,
-                         unsigned flags)
+                         uct_pack_callback_t pack_cb, void *arg)
 {
     uct_mm_fifo_element_t *elem;
     ucs_status_t status;
@@ -310,7 +315,7 @@ retry:
     }
     elem->flags = elem_flags;
 
-    if (ucs_unlikely(flags & UCT_SEND_FLAG_SIGNALED)) {
+    if (ucs_unlikely(head & UCT_MM_IFACE_FIFO_HEAD_EVENT_ARMED)) {
         uct_mm_ep_signal_remote(ep);
     }
 
@@ -336,7 +341,7 @@ ucs_status_t uct_mm_ep_am_short(uct_ep_h tl_ep, uint8_t id, uint64_t header,
 
     return (ucs_status_t)uct_mm_ep_am_common_send(UCT_MM_SEND_AM_SHORT, ep,
                                                   iface, id, length, header,
-                                                  payload, NULL, NULL, 0);
+                                                  payload, NULL, NULL);
 }
 
 ssize_t uct_mm_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id, uct_pack_callback_t pack_cb,
@@ -346,7 +351,7 @@ ssize_t uct_mm_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id, uct_pack_callback_t pack_
     uct_mm_ep_t *ep = ucs_derived_of(tl_ep, uct_mm_ep_t);
 
     return uct_mm_ep_am_common_send(UCT_MM_SEND_AM_BCOPY, ep, iface, id, 0, 0,
-                                    NULL, pack_cb, arg, flags);
+                                    NULL, pack_cb, arg);
 }
 
 static inline int uct_mm_ep_has_tx_resources(uct_mm_ep_t *ep)
@@ -416,7 +421,7 @@ ucs_arbiter_cb_result_t uct_mm_ep_process_pending(ucs_arbiter_t *arbiter,
     }
 }
 
-static ucs_arbiter_cb_result_t uct_mm_ep_abriter_purge_cb(ucs_arbiter_t *arbiter,
+static ucs_arbiter_cb_result_t uct_mm_ep_arbiter_purge_cb(ucs_arbiter_t *arbiter,
                                                           ucs_arbiter_group_t *group,
                                                           ucs_arbiter_elem_t *elem,
                                                           void *arg)
@@ -444,7 +449,7 @@ void uct_mm_ep_pending_purge(uct_ep_h tl_ep, uct_pending_purge_callback_t cb,
     uct_purge_cb_args_t  args = {cb, arg};
 
     ucs_arbiter_group_purge(&iface->arbiter, &ep->arb_group,
-                            uct_mm_ep_abriter_purge_cb, &args);
+                            uct_mm_ep_arbiter_purge_cb, &args);
 }
 
 ucs_status_t uct_mm_ep_flush(uct_ep_h tl_ep, unsigned flags,
@@ -466,4 +471,43 @@ ucs_status_t uct_mm_ep_flush(uct_ep_h tl_ep, unsigned flags,
     ucs_memory_cpu_store_fence();
     UCT_TL_EP_STAT_FLUSH(&ep->super);
     return UCS_OK;
+}
+
+ucs_status_t
+uct_mm_ep_check(uct_ep_h tl_ep, unsigned flags, uct_completion_t *comp)
+{
+    uct_mm_ep_t *ep    = ucs_derived_of(tl_ep, uct_mm_ep_t);
+    uct_iface_h  iface = ep->super.super.iface;
+    ucs_status_t status;
+    int proc_len;
+
+    if (ep->keepalive == NULL) {
+        proc_len = uct_sm_ep_get_process_proc_dir(NULL, 0,
+                                                  ep->fifo_ctl->owner.pid);
+        if (proc_len <= 0) {
+            return UCS_ERR_INVALID_PARAM;
+        }
+
+        ep->keepalive = ucs_malloc(sizeof(*ep->keepalive) + proc_len + 1,
+                                   "mm_ep->keepalive");
+        if (ep->keepalive == NULL) {
+            status = UCS_ERR_NO_MEMORY;
+            goto err_set_ep_failed;
+        }
+
+        ep->keepalive->starttime = ep->fifo_ctl->owner.starttime;
+        uct_sm_ep_get_process_proc_dir(ep->keepalive->proc, proc_len + 1,
+                                       ep->fifo_ctl->owner.pid);
+    }
+
+    status = uct_sm_ep_check(ep->keepalive->proc, ep->keepalive->starttime,
+                             flags, comp);
+    if (status != UCS_OK) {
+        goto err_set_ep_failed;
+    }
+    return UCS_OK;
+
+err_set_ep_failed:
+    return uct_set_ep_failed(&UCS_CLASS_NAME(uct_mm_ep_t), &ep->super.super,
+                             iface, status);
 }

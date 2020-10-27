@@ -51,8 +51,6 @@ ucs_status_t uct_rc_txqp_init(uct_rc_txqp_t *txqp, uct_rc_iface_t *iface,
                               UCS_STATS_ARG(ucs_stats_node_t* stats_parent))
 {
     txqp->unsignaled = 0;
-    txqp->unsignaled_store = 0;
-    txqp->unsignaled_store_count = 0;
     txqp->available  = 0;
     ucs_queue_head_init(&txqp->outstanding);
 
@@ -60,9 +58,9 @@ ucs_status_t uct_rc_txqp_init(uct_rc_txqp_t *txqp, uct_rc_iface_t *iface,
                                 stats_parent, "-0x%x", qp_num);
 }
 
-void uct_rc_txqp_cleanup(uct_rc_txqp_t *txqp)
+void uct_rc_txqp_cleanup(uct_rc_iface_t *iface, uct_rc_txqp_t *txqp)
 {
-    uct_rc_txqp_purge_outstanding(txqp, UCS_ERR_CANCELED, 1);
+    ucs_assert(ucs_queue_is_empty(&txqp->outstanding));
     UCS_STATS_NODE_FREE(txqp->stats);
 }
 
@@ -71,8 +69,7 @@ ucs_status_t uct_rc_fc_init(uct_rc_fc_t *fc, int16_t winsize
 {
     ucs_status_t status;
 
-    fc->fc_wnd     = winsize;
-    fc->flags      = 0;
+    fc->fc_wnd = winsize;
 
     status = UCS_STATS_NODE_ALLOC(&fc->stats, &uct_rc_fc_stats_class,
                                   stats_parent);
@@ -90,6 +87,47 @@ void uct_rc_fc_cleanup(uct_rc_fc_t *fc)
     UCS_STATS_NODE_FREE(fc->stats);
 }
 
+void uct_rc_ep_cleanup_qp(uct_rc_iface_t *iface, uct_rc_ep_t *ep,
+                          uct_rc_ep_cleanup_ctx_t *cleanup_ctx, uint32_t qp_num)
+{
+    uct_rc_iface_ops_t *ops = ucs_derived_of(iface->super.ops, uct_rc_iface_ops_t);
+    uct_ib_md_t *md         = uct_ib_iface_md(&iface->super);
+    ucs_status_t status;
+
+    cleanup_ctx->iface     = iface;
+    cleanup_ctx->super.cbq = &iface->super.super.worker->super.progress_q;
+    cleanup_ctx->super.cb  = ops->cleanup_qp;
+
+    ucs_list_del(&ep->list);
+    ucs_list_add_tail(&iface->ep_gc_list, &cleanup_ctx->list);
+
+    uct_rc_iface_remove_qp(iface, qp_num);
+
+    status = uct_ib_device_async_event_wait(&md->dev,
+                                            IBV_EVENT_QP_LAST_WQE_REACHED,
+                                            qp_num, &cleanup_ctx->super);
+    if (status == UCS_OK) {
+        /* event already arrived, finish cleaning up */
+        ops->cleanup_qp(&cleanup_ctx->super);
+    } else {
+        /* deferred cleanup callback was scheduled */
+        ucs_assert(status == UCS_INPROGRESS);
+    }
+}
+
+void uct_rc_ep_cleanup_qp_done(uct_rc_ep_cleanup_ctx_t *cleanup_ctx,
+                               uint32_t qp_num)
+{
+    uct_ib_md_t *md = ucs_derived_of(cleanup_ctx->iface->super.super.md,
+                                     uct_ib_md_t);
+
+    uct_ib_device_async_event_unregister(&md->dev,
+                                         IBV_EVENT_QP_LAST_WQE_REACHED,
+                                         qp_num);
+    ucs_list_del(&cleanup_ctx->list);
+    ucs_free(cleanup_ctx);
+}
+
 UCS_CLASS_INIT_FUNC(uct_rc_ep_t, uct_rc_iface_t *iface, uint32_t qp_num,
                     const uct_ep_params_t *params)
 {
@@ -104,6 +142,7 @@ UCS_CLASS_INIT_FUNC(uct_rc_ep_t, uct_rc_iface_t *iface, uint32_t qp_num,
     }
 
     self->path_index = UCT_EP_PARAMS_GET_PATH_INDEX(params);
+    self->flags      = 0;
 
     status = uct_rc_fc_init(&self->fc, iface->config.fc_wnd_size
                             UCS_STATS_ARG(self->super.stats));
@@ -121,18 +160,20 @@ UCS_CLASS_INIT_FUNC(uct_rc_ep_t, uct_rc_iface_t *iface, uint32_t qp_num,
     return UCS_OK;
 
 err_txqp_cleanup:
-    uct_rc_txqp_cleanup(&self->txqp);
+    uct_rc_txqp_cleanup(iface, &self->txqp);
     return status;
 }
 
 static UCS_CLASS_CLEANUP_FUNC(uct_rc_ep_t)
 {
+    uct_rc_iface_t *iface = ucs_derived_of(self->super.super.iface,
+                                           uct_rc_iface_t);
+
     ucs_debug("destroy rc ep %p", self);
 
-    ucs_list_del(&self->list);
     uct_rc_ep_pending_purge(&self->super.super, NULL, NULL);
     uct_rc_fc_cleanup(&self->fc);
-    uct_rc_txqp_cleanup(&self->txqp);
+    uct_rc_txqp_cleanup(iface, &self->txqp);
 }
 
 UCS_CLASS_DEFINE(uct_rc_ep_t, uct_base_ep_t)
@@ -149,9 +190,9 @@ void uct_rc_ep_packet_dump(uct_base_iface_t *iface, uct_am_trace_type_t type,
     if (fc_hdr != UCT_RC_EP_FC_PURE_GRANT) {
         am_wo_fc = rch->am_id & ~UCT_RC_EP_FC_MASK; /* mask out FC bits*/
         snprintf(buffer, max, " %c%c am %d ",
-                 fc_hdr & UCT_RC_EP_FC_FLAG_SOFT_REQ ? 's' :
-                 fc_hdr & UCT_RC_EP_FC_FLAG_HARD_REQ ? 'h' : '-',
-                 fc_hdr & UCT_RC_EP_FC_FLAG_GRANT    ? 'g' : '-',
+                 fc_hdr & UCT_RC_EP_FLAG_FC_SOFT_REQ ? 's' :
+                 fc_hdr & UCT_RC_EP_FLAG_FC_HARD_REQ ? 'h' : '-',
+                 fc_hdr & UCT_RC_EP_FLAG_FC_GRANT    ? 'g' : '-',
                  am_wo_fc);
         uct_iface_dump_am(iface, type, am_wo_fc, rch + 1, length - sizeof(*rch),
                           buffer + strlen(buffer), max - strlen(buffer));
@@ -160,20 +201,73 @@ void uct_rc_ep_packet_dump(uct_base_iface_t *iface, uct_am_trace_type_t type,
     }
 }
 
-static UCS_F_ALWAYS_INLINE void
-uct_rc_op_release_iface_resources(uct_rc_iface_send_op_t *op, int is_get_zcopy)
+void uct_rc_ep_send_op_set_iov(uct_rc_iface_send_op_t *op, const uct_iov_t *iov,
+                               size_t iovcnt)
 {
-    uct_rc_iface_send_desc_t *desc;
-    uct_rc_iface_t *iface;
+#ifndef NVALGRIND
+    size_t op_iovcnt = iovcnt;
+    ucs_iov_iter_t iov_iter;
 
-    if (is_get_zcopy) {
-        ++op->iface->tx.reads_available;
+    if (!RUNNING_ON_VALGRIND) {
         return;
     }
 
-    desc  = ucs_derived_of(op, uct_rc_iface_send_desc_t);
-    iface = ucs_container_of(ucs_mpool_obj_owner(desc), uct_rc_iface_t, tx.mp);
-    ++iface->tx.reads_available;
+    op->iov = ucs_malloc(sizeof(*op->iov) * iovcnt, "rc_get_zcopy_iov");
+    if (op->iov == NULL) {
+        return;
+    }
+
+    ucs_iov_iter_init(&iov_iter);
+    uct_iov_to_iovec(op->iov, &op_iovcnt, iov, iovcnt, SIZE_MAX, &iov_iter);
+#endif
+}
+
+static UCS_F_NOINLINE void
+uct_rc_ep_send_op_completed_iov(uct_rc_iface_send_op_t *op)
+{
+#ifndef NVALGRIND
+    struct iovec *iov_entry = op->iov;
+    size_t length           = 0;
+
+    ucs_assert(op->flags & UCT_RC_IFACE_SEND_OP_FLAG_IOV);
+
+    if (iov_entry == NULL) {
+        return;
+    }
+
+    while (length < op->length) {
+        /* The memory might not be HOST */
+        VALGRIND_MAKE_MEM_DEFINED_IF_ADDRESSABLE(iov_entry->iov_base,
+                                                 iov_entry->iov_len);
+        length += iov_entry->iov_len;
+        ++iov_entry;
+    }
+
+    ucs_free(op->iov);
+    op->iov = NULL;
+#endif
+}
+
+static UCS_F_ALWAYS_INLINE void
+uct_rc_op_release_get_bcopy(uct_rc_iface_send_op_t *op)
+{
+    uct_rc_iface_send_desc_t *desc = ucs_derived_of(op, uct_rc_iface_send_desc_t);
+    uct_rc_iface_t          *iface = ucs_container_of(ucs_mpool_obj_owner(desc),
+                                                      uct_rc_iface_t, tx.mp);
+
+    iface->tx.reads_completed += op->length;
+}
+
+static UCS_F_ALWAYS_INLINE void
+uct_rc_op_release_get_zcopy(uct_rc_iface_send_op_t *op)
+{
+    op->iface->tx.reads_completed += op->length;
+
+    if (RUNNING_ON_VALGRIND) {
+        uct_rc_ep_send_op_completed_iov(op);
+    }
+
+    op->flags &= ~UCT_RC_IFACE_SEND_OP_FLAG_IOV;
 }
 
 void uct_rc_ep_get_bcopy_handler(uct_rc_iface_send_op_t *op, const void *resp)
@@ -184,7 +278,7 @@ void uct_rc_ep_get_bcopy_handler(uct_rc_iface_send_op_t *op, const void *resp)
 
     desc->unpack_cb(desc->super.unpack_arg, resp, desc->super.length);
 
-    uct_rc_op_release_iface_resources(op, 0);
+    uct_rc_op_release_get_bcopy(op);
     uct_invoke_completion(desc->super.user_comp, UCS_OK);
     ucs_mpool_put(desc);
 }
@@ -197,14 +291,14 @@ void uct_rc_ep_get_bcopy_handler_no_completion(uct_rc_iface_send_op_t *op,
     VALGRIND_MAKE_MEM_DEFINED(resp, desc->super.length);
 
     desc->unpack_cb(desc->super.unpack_arg, resp, desc->super.length);
-    uct_rc_op_release_iface_resources(op, 0);
+    uct_rc_op_release_get_bcopy(op);
     ucs_mpool_put(desc);
 }
 
 void uct_rc_ep_get_zcopy_completion_handler(uct_rc_iface_send_op_t *op,
                                             const void *resp)
 {
-    uct_rc_op_release_iface_resources(op, 1);
+    uct_rc_op_release_get_zcopy(op);
     uct_rc_ep_send_op_completion_handler(op, resp);
 }
 
@@ -252,38 +346,30 @@ ucs_arbiter_cb_result_t uct_rc_ep_process_pending(ucs_arbiter_t *arbiter,
                                                   void *arg)
 {
     uct_pending_req_t *req = ucs_container_of(elem, uct_pending_req_t, priv);
-    uct_rc_iface_t *iface UCS_V_UNUSED;
+    uct_rc_ep_t *ep        = ucs_container_of(group, uct_rc_ep_t, arb_group);;
+    uct_rc_iface_t *iface  = ucs_derived_of(ep->super.super.iface, uct_rc_iface_t);
     ucs_status_t status;
-    uct_rc_ep_t *ep;
 
-    ucs_trace_data("progressing pending request %p", req);
-    status = req->func(req);
-    ucs_trace_data("status returned from progress pending: %s",
-                   ucs_status_string(status));
-
+    status = uct_rc_iface_invoke_pending_cb(iface, req);
     if (status == UCS_OK) {
         return UCS_ARBITER_CB_RESULT_REMOVE_ELEM;
     } else if (status == UCS_INPROGRESS) {
         return UCS_ARBITER_CB_RESULT_NEXT_GROUP;
+    } else if (!uct_rc_iface_has_tx_resources(iface)) {
+        /* No iface resources */
+        return UCS_ARBITER_CB_RESULT_STOP;
     } else {
-        ep    = ucs_container_of(group, uct_rc_ep_t, arb_group);
-        iface = ucs_derived_of(ep->super.super.iface, uct_rc_iface_t);
-        if (!uct_rc_iface_has_tx_resources(iface)) {
-            /* No iface resources */
-            return UCS_ARBITER_CB_RESULT_STOP;
-        } else {
-            /* No ep resources */
-            ucs_assertv(!uct_rc_ep_has_tx_resources(ep),
-                        "pending callback returned error but send resources are available");
-            return UCS_ARBITER_CB_RESULT_DESCHED_GROUP;
-        }
+        /* No ep resources */
+        ucs_assertv(!uct_rc_ep_has_tx_resources(ep),
+                    "pending callback returned error but send resources are available");
+        return UCS_ARBITER_CB_RESULT_DESCHED_GROUP;
     }
 }
 
-static ucs_arbiter_cb_result_t uct_rc_ep_abriter_purge_cb(ucs_arbiter_t *arbiter,
-                                                          ucs_arbiter_group_t *group,
-                                                          ucs_arbiter_elem_t *elem,
-                                                          void *arg)
+ucs_arbiter_cb_result_t uct_rc_ep_arbiter_purge_cb(ucs_arbiter_t *arbiter,
+                                                   ucs_arbiter_group_t *group,
+                                                   ucs_arbiter_elem_t *elem,
+                                                   void *arg)
 {
     uct_purge_cb_args_t *cb_args    = arg;
     uct_pending_purge_callback_t cb = cb_args->cb;
@@ -291,17 +377,17 @@ static ucs_arbiter_cb_result_t uct_rc_ep_abriter_purge_cb(ucs_arbiter_t *arbiter
                                                        priv);
     uct_rc_ep_t UCS_V_UNUSED *ep    = ucs_container_of(group, uct_rc_ep_t,
                                                        arb_group);
-    uct_rc_fc_request_t *freq;
+    uct_rc_pending_req_t *freq;
 
     /* Invoke user's callback only if it is not internal FC message */
-    if (ucs_likely(req->func != uct_rc_ep_fc_grant)){
+    if (ucs_likely(req->func != uct_rc_ep_fc_grant)) {
         if (cb != NULL) {
             cb(req, cb_args->arg);
         } else {
             ucs_debug("ep=%p cancelling user pending request %p", ep, req);
         }
     } else {
-        freq = ucs_derived_of(req, uct_rc_fc_request_t);
+        freq = ucs_derived_of(req, uct_rc_pending_req_t);
         ucs_mpool_put(freq);
     }
     return UCS_ARBITER_CB_RESULT_REMOVE_ELEM;
@@ -315,16 +401,16 @@ void uct_rc_ep_pending_purge(uct_ep_h tl_ep, uct_pending_purge_callback_t cb,
     uct_purge_cb_args_t  args = {cb, arg};
 
     ucs_arbiter_group_purge(&iface->tx.arbiter, &ep->arb_group,
-                            uct_rc_ep_abriter_purge_cb, &args);
+                            uct_rc_ep_arbiter_purge_cb, &args);
 }
 
 ucs_status_t uct_rc_ep_fc_grant(uct_pending_req_t *self)
 {
     ucs_status_t status;
-    uct_rc_fc_request_t *freq = ucs_derived_of(self, uct_rc_fc_request_t);
-    uct_rc_ep_t *ep           = ucs_derived_of(freq->ep, uct_rc_ep_t);
-    uct_rc_iface_t *iface     = ucs_derived_of(ep->super.super.iface,
-                                               uct_rc_iface_t);
+    uct_rc_pending_req_t *freq = ucs_derived_of(self, uct_rc_pending_req_t);
+    uct_rc_ep_t *ep            = ucs_derived_of(freq->ep, uct_rc_ep_t);
+    uct_rc_iface_t *iface      = ucs_derived_of(ep->super.super.iface,
+                                                uct_rc_iface_t);
 
     ucs_assert_always(iface->config.fc_enabled);
     status = uct_rc_fc_ctrl(&ep->super.super, UCT_RC_EP_FC_PURE_GRANT, NULL);
@@ -335,15 +421,16 @@ ucs_status_t uct_rc_ep_fc_grant(uct_pending_req_t *self)
     return status;
 }
 
-void uct_rc_txqp_purge_outstanding(uct_rc_txqp_t *txqp, ucs_status_t status,
-                                   int is_log)
+void uct_rc_txqp_purge_outstanding(uct_rc_iface_t *iface, uct_rc_txqp_t *txqp,
+                                   ucs_status_t status, uint16_t sn, int warn)
 {
     uct_rc_iface_send_op_t *op;
     uct_rc_iface_send_desc_t *desc;
 
-    ucs_queue_for_each_extract(op, &txqp->outstanding, queue, 1) {
+    ucs_queue_for_each_extract(op, &txqp->outstanding, queue,
+                               UCS_CIRCULAR_COMPARE16(op->sn, <=, sn)) {
         if (op->handler != (uct_rc_send_handler_t)ucs_mpool_put) {
-            if (is_log != 0) {
+            if (warn) {
                 ucs_warn("destroying rc ep %p with uncompleted operation %p",
                          txqp, op);
             }
@@ -361,9 +448,11 @@ void uct_rc_txqp_purge_outstanding(uct_rc_txqp_t *txqp, ucs_status_t status,
             /* Need to release rdma_read resources taken by get operations  */
             if ((op->handler == uct_rc_ep_get_bcopy_handler) ||
                 (op->handler == uct_rc_ep_get_bcopy_handler_no_completion)) {
-                uct_rc_op_release_iface_resources(op, 0);
+                uct_rc_op_release_get_bcopy(op);
+                uct_rc_iface_update_reads(iface);
             } else if (op->handler == uct_rc_ep_get_zcopy_completion_handler) {
-                uct_rc_op_release_iface_resources(op, 1);
+                uct_rc_op_release_get_zcopy(op);
+                uct_rc_iface_update_reads(iface);
             }
         }
         op->flags &= ~(UCT_RC_IFACE_SEND_OP_FLAG_INUSE |
@@ -397,28 +486,6 @@ ucs_status_t uct_rc_ep_flush(uct_rc_ep_t *ep, int16_t max_available,
     }
 
     return UCS_INPROGRESS;
-}
-
-ucs_status_t uct_rc_ep_check_cqe(uct_rc_iface_t *iface, uct_rc_ep_t *ep)
-{
-    uct_rc_txqp_t *txqp;
-
-    if (!uct_rc_iface_have_tx_cqe_avail(iface)) {
-        UCS_STATS_UPDATE_COUNTER(iface->stats, UCT_RC_IFACE_STAT_NO_CQE, 1);
-        UCS_STATS_UPDATE_COUNTER(ep->super.stats, UCT_EP_STAT_NO_RES, 1);
-        return UCS_ERR_NO_RESOURCE;
-    }
-
-    txqp = &ep->txqp;
-    /* if unsignaled == RC_UNSIGNALED_INF this value was already saved and \
-       next operation will be defenitly signaled */
-    if (txqp->unsignaled != RC_UNSIGNALED_INF) {
-        txqp->unsignaled_store_count++;
-        txqp->unsignaled_store += txqp->unsignaled;
-        txqp->unsignaled        = RC_UNSIGNALED_INF;
-    }
-
-    return UCS_OK;
 }
 
 #define UCT_RC_DEFINE_ATOMIC_HANDLER_FUNC(_num_bits, _is_be) \

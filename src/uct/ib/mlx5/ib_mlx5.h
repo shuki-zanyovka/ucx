@@ -59,6 +59,7 @@
 #define UCT_IB_MLX5_AV_GRH_PRESENT      0x40 /* htonl(UCS_BIT(30)) */
 #define UCT_IB_MLX5_BF_REG_SIZE         256
 #define UCT_IB_MLX5_CQE_VENDOR_SYND_ODP 0x93
+#define UCT_IB_MLX5_CQE_VENDOR_SYND_PSN 0x99
 #define UCT_IB_MLX5_CQE_OP_OWN_ERR_MASK 0x80
 #define UCT_IB_MLX5_MAX_SEND_WQE_SIZE   (UCT_IB_MLX5_MAX_BB * MLX5_SEND_WQE_BB)
 #define UCT_IB_MLX5_CQ_SET_CI           0
@@ -67,6 +68,9 @@
 #define UCT_IB_MLX5_ATOMIC_MODE         3
 #define UCT_IB_MLX5_CQE_FLAG_L3_IN_DATA UCS_BIT(28) /* GRH/IP in the receive buffer */
 #define UCT_IB_MLX5_CQE_FLAG_L3_IN_CQE  UCS_BIT(29) /* GRH/IP in the CQE */
+#define UCT_IB_MLX5_MP_RQ_BYTE_CNT_MASK 0x0000FFFF  /* Byte count mask for multi-packet RQs */
+#define UCT_IB_MLX5_MP_RQ_LAST_MSG_FLAG UCS_BIT(30) /* MP last packet indication */
+#define UCT_IB_MLX5_MP_RQ_FILLER_FLAG   UCS_BIT(31) /* Filler CQE indicator */
 
 
 #define UCT_IB_MLX5_OPMOD_EXT_ATOMIC(_log_arg_size) \
@@ -118,6 +122,14 @@ struct mlx5_grh_av {
       (_av_size) + \
       sizeof(struct mlx5_wqe_inl_data_seg)))
 
+#define UCT_IB_MLX5_SET_BASE_AV(to_base_av, from_base_av) \
+    do { \
+        (to_base_av)->dqp_dct      = (from_base_av)->dqp_dct; \
+        (to_base_av)->stat_rate_sl = (from_base_av)->stat_rate_sl; \
+        (to_base_av)->fl_mlid      = (from_base_av)->fl_mlid; \
+        (to_base_av)->rlid         = (from_base_av)->rlid; \
+    } while (0)
+
 #define UCT_IB_MLX5_AM_ZCOPY_MAX_HDR(_av_size) \
     (UCT_IB_MLX5_AM_MAX_SHORT(_av_size) - \
      UCT_IB_MLX5_AM_ZCOPY_MAX_IOV * sizeof(struct mlx5_wqe_data_seg))
@@ -166,6 +178,12 @@ enum {
     UCT_IB_MLX5_SRQ_TOPO_CYCLIC_MP_RQ = 0x3
 };
 
+#if HAVE_DEVX
+typedef struct uct_ib_mlx5_devx_umem {
+    struct mlx5dv_devx_umem  *mem;
+    size_t                   size;
+} uct_ib_mlx5_devx_umem_t;
+#endif
 
 /**
  * MLX5 IB memory domain.
@@ -180,8 +198,10 @@ typedef struct uct_ib_mlx5_md {
     struct ibv_cq            *umr_cq;   /* special CQ for creating UMR */
 #endif
 
+#if HAVE_DEVX
     void                     *zero_buf;
-    struct mlx5dv_devx_umem  *zero_mem;
+    uct_ib_mlx5_devx_umem_t  zero_mem;
+#endif
 } uct_ib_mlx5_md_t;
 
 
@@ -245,7 +265,7 @@ typedef struct uct_ib_mlx5_srq {
 #if HAVE_DEVX
         struct {
             uct_ib_mlx5_dbrec_t        *dbrec;
-            struct mlx5dv_devx_umem    *mem;
+            uct_ib_mlx5_devx_umem_t    mem;
             struct mlx5dv_devx_obj     *obj;
         } devx;
 #endif
@@ -322,7 +342,7 @@ typedef struct uct_ib_mlx5_qp {
         struct {
             void                       *wq_buf;
             uct_ib_mlx5_dbrec_t        *dbrec;
-            struct mlx5dv_devx_umem    *mem;
+            uct_ib_mlx5_devx_umem_t    mem;
             struct mlx5dv_devx_obj     *obj;
         } devx;
 #endif
@@ -439,39 +459,7 @@ struct uct_ib_mlx5_atomic_masked_fadd64_seg {
     uint64_t           filed_boundary;
 } UCS_S_PACKED;
 
-/**
- * Calculate unique id for atomic
- */
-static inline uint8_t uct_ib_mlx5_md_get_atomic_mr_id(uct_ib_mlx5_md_t *md)
-{
-#if HAVE_EXP_UMR
-    if ((md->umr_qp == NULL) || (md->umr_cq == NULL)) {
-        return 0;
-    }
-#elif HAVE_DEVX
-    if (!(md->flags & UCT_IB_MLX5_MD_FLAG_DEVX)) {
-        return 0;
-    }
-#else
-    return 0;
-#endif
-
-    /* Generate atomic UMR id. We want umrs for same virtual addresses to have
-     * different ids across processes.
-     *
-     * Usually parallel processes running on the same node as part of a single
-     * job will have consecutive PIDs. For example MPI ranks, slurm spawned tasks...
-     */
-    return getpid() % 256;
-}
-
-static inline uint8_t uct_ib_mlx5_iface_get_atomic_mr_id(uct_ib_iface_t *iface)
-{
-    ucs_assert(ucs_derived_of(iface->super.md, uct_ib_md_t)->dev.flags &
-               UCT_IB_DEVICE_FLAG_MLX5_PRM);
-    return uct_ib_mlx5_md_get_atomic_mr_id(ucs_derived_of(iface->super.md,
-                                           uct_ib_mlx5_md_t));
-}
+ucs_status_t uct_ib_mlx5_md_get_atomic_mr_id(uct_ib_md_t *md, uint8_t *mr_id);
 
 ucs_status_t uct_ib_mlx5_iface_get_res_domain(uct_ib_iface_t *iface,
                                               uct_ib_mlx5_qp_t *txwq);
@@ -485,6 +473,8 @@ ucs_status_t uct_ib_mlx5_iface_create_qp(uct_ib_iface_t *iface,
 ucs_status_t uct_ib_mlx5_modify_qp_state(uct_ib_mlx5_md_t *md,
                                          uct_ib_mlx5_qp_t *qp,
                                          enum ibv_qp_state state);
+
+void uct_ib_mlx5_destroy_qp(uct_ib_mlx5_md_t *md, uct_ib_mlx5_qp_t *qp);
 
 /**
  * Create CQ with DV
@@ -529,7 +519,8 @@ ucs_status_t uct_ib_mlx5_txwq_init(uct_priv_worker_t *worker,
                                    uct_ib_mlx5_mmio_mode_t cfg_mmio_mode,
                                    uct_ib_mlx5_txwq_t *txwq, struct ibv_qp *verbs_qp);
 
-void uct_ib_mlx5_txwq_cleanup(uct_ib_mlx5_txwq_t* txwq);
+void uct_ib_mlx5_qp_mmio_cleanup(uct_ib_mlx5_qp_t *qp,
+                                 uct_ib_mlx5_mmio_reg_t *reg);
 
 /**
  * Reset txwq contents and posting indices.
@@ -584,7 +575,72 @@ ucs_status_t uct_ib_mlx5_devx_modify_qp(uct_ib_mlx5_qp_t *qp,
 ucs_status_t uct_ib_mlx5_devx_modify_qp_state(uct_ib_mlx5_qp_t *qp,
                                               enum ibv_qp_state state);
 
-void uct_ib_mlx5_devx_destroy_qp(uct_ib_mlx5_qp_t *qp);
+void uct_ib_mlx5_devx_destroy_qp(uct_ib_mlx5_md_t *md, uct_ib_mlx5_qp_t *qp);
+
+static inline ucs_status_t
+uct_ib_mlx5_md_buf_alloc(uct_ib_mlx5_md_t *md, size_t size, int silent,
+                         void **buf_p, uct_ib_mlx5_devx_umem_t *mem,
+                         char *name)
+{
+    ucs_log_level_t level = silent ? UCS_LOG_LEVEL_DEBUG : UCS_LOG_LEVEL_ERROR;
+    ucs_status_t status;
+    void *buf;
+    int ret;
+
+    ret = ucs_posix_memalign(&buf, ucs_get_page_size(), size, name);
+    if (ret != 0) {
+        ucs_log(level, "failed to allocate buffer of %zu bytes: %m", size);
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    if (md->super.fork_init) {
+        ret = madvise(buf, size, MADV_DONTFORK);
+        if (ret != 0) {
+            ucs_log(level, "madvise(DONTFORK, buf=%p, len=%zu) failed: %m", buf, size);
+            status = UCS_ERR_IO_ERROR;
+            goto err_free;
+        }
+    }
+
+    mem->size = size;
+    mem->mem  = mlx5dv_devx_umem_reg(md->super.dev.ibv_context, buf, size, 0);
+    if (mem->mem == NULL) {
+        ucs_log(level, "mlx5dv_devx_umem_reg() failed: %m");
+        status = UCS_ERR_NO_MEMORY;
+        goto err_dofork;
+    }
+
+    *buf_p = buf;
+    return UCS_OK;
+
+err_dofork:
+    if (md->super.fork_init) {
+        madvise(buf, size, MADV_DOFORK);
+    }
+err_free:
+    ucs_free(buf);
+
+    return status;
+}
+
+static inline void
+uct_ib_mlx5_md_buf_free(uct_ib_mlx5_md_t *md, void *buf, uct_ib_mlx5_devx_umem_t *mem)
+{
+    int ret;
+
+    if (buf == NULL) {
+        return;
+    }
+
+    mlx5dv_devx_umem_dereg(mem->mem);
+    if (md->super.fork_init) {
+        ret = madvise(buf, mem->size, MADV_DOFORK);
+        if (ret != 0) {
+            ucs_warn("madvise(DOFORK, buf=%p, len=%zu) failed: %m", buf, mem->size);
+        }
+    }
+    ucs_free(buf);
+}
 
 #else
 
@@ -610,7 +666,7 @@ uct_ib_mlx5_devx_modify_qp_state(uct_ib_mlx5_qp_t *qp, enum ibv_qp_state state)
     return UCS_ERR_UNSUPPORTED;
 }
 
-static inline void uct_ib_mlx5_devx_destroy_qp(uct_ib_mlx5_qp_t *qp) { }
+static inline void uct_ib_mlx5_devx_destroy_qp(uct_ib_mlx5_md_t *md, uct_ib_mlx5_qp_t *qp) { }
 
 #endif
 

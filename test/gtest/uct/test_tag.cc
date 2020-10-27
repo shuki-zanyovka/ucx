@@ -87,15 +87,16 @@ public:
     void init_send_ctx(send_ctx &s,mapped_buffer *b, uct_tag_t t, uint64_t i,
                        bool unexp_flow = true)
     {
-        s.mbuf           = b;
-        s.rndv_op        = NULL;
-        s.tag            = t;
-        s.imm_data       = i;
-        s.uct_comp.count = 1;
-        s.uct_comp.func  = send_completion;
-        s.sw_rndv        = s.comp = false;
-        s.unexp          = unexp_flow;
-        s.status         = UCS_ERR_NO_PROGRESS;
+        s.mbuf            = b;
+        s.rndv_op         = NULL;
+        s.tag             = t;
+        s.imm_data        = i;
+        s.uct_comp.count  = 1;
+        s.uct_comp.status = UCS_OK;
+        s.uct_comp.func   = send_completion;
+        s.sw_rndv         = s.comp = false;
+        s.unexp           = unexp_flow;
+        s.status          = UCS_ERR_NO_PROGRESS;
     }
 
     void init_recv_ctx(recv_ctx &r,  mapped_buffer *b, uct_tag_t t,
@@ -450,11 +451,11 @@ public:
         return UCS_LOG_FUNC_RC_CONTINUE;
     }
 
-    static void send_completion(uct_completion_t *self, ucs_status_t status)
+    static void send_completion(uct_completion_t *self)
     {
         send_ctx *user_ctx = ucs_container_of(self, send_ctx, uct_comp);
         user_ctx->comp     = true;
-        user_ctx->status   = status;
+        user_ctx->status   = self->status;
     }
 
 
@@ -1001,9 +1002,10 @@ test_tag_mp_xrq::test_tag_mp_xrq() : m_hold_uct_desc(false),
                                      m_first_received(false),
                                      m_last_received(false)
 {
-    m_max_hdr        = sizeof(ibv_tmh) + sizeof(ibv_rvh);
-    m_uct_comp.count = 512; // We do not need completion func to be invoked
-    m_uct_comp.func  = NULL;
+    m_max_hdr         = sizeof(ibv_tmh) + sizeof(ibv_rvh);
+    m_uct_comp.count  = 512; // We do not need completion func to be invoked
+    m_uct_comp.status = UCS_OK;
+    m_uct_comp.func   = NULL;
 }
 
 uct_rc_mlx5_iface_common_t* test_tag_mp_xrq::rc_mlx5_iface(entity &e)

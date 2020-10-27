@@ -4,15 +4,16 @@
 * Copyright (C) UT-Battelle, LLC. 2014-2015. ALL RIGHTS RESERVED.
 * See file LICENSE for terms.
 */
+
+#include "uct_test.h"
+#include "uct_p2p_test.h"
+#include <common/test.h>
 extern "C" {
 #include <uct/api/uct.h>
 #include <uct/base/uct_iface.h>
 
 #include <ucs/time/time.h>
 }
-#include <common/test.h>
-#include "uct_test.h"
-#include "uct_p2p_test.h"
 
 #ifdef ENABLE_STATS
 
@@ -27,8 +28,9 @@ extern "C" {
 class test_uct_stats : public uct_p2p_test {
 public:
     test_uct_stats() : uct_p2p_test(0), lbuf(NULL), rbuf(NULL) {
-        m_comp.func  = NULL;
-        m_comp.count = 0;
+        m_comp.func   = NULL;
+        m_comp.count  = 0;
+        m_comp.status = UCS_OK;
     }
 
     virtual void init() {
@@ -90,8 +92,13 @@ public:
     void init_bufs(size_t min, size_t max)
     {
         size_t size = ucs_max(min, ucs_min(64ul, max));
-        lbuf = new mapped_buffer(size, 0, sender(), 0, sender().md_attr().cap.access_mem_type);
-        rbuf = new mapped_buffer(size, 0, receiver(), 0, sender().md_attr().cap.access_mem_type);
+        uint8_t mem_type_index;
+
+        ucs_assert(sender().md_attr().cap.access_mem_types != 0);
+        mem_type_index = ucs_ffs64(sender().md_attr().cap.access_mem_types);
+
+        lbuf = new mapped_buffer(size, 0, sender(), 0, (ucs_memory_type_t)mem_type_index);
+        rbuf = new mapped_buffer(size, 0, receiver(), 0, (ucs_memory_type_t)mem_type_index);
     }
 
     virtual void cleanup() {
@@ -162,8 +169,9 @@ public:
     }
 
     void init_completion() {
-        m_comp.count = 2;
-        m_comp.func  = NULL;
+        m_comp.count  = 2;
+        m_comp.status = UCS_OK;
+        m_comp.func   = NULL;
     }
 
     void wait_for_completion(ucs_status_t status) {
